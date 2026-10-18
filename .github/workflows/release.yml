@@ -1,0 +1,66 @@
+# The Release workflow of the PUBLIC Cirrus Data Tracker repository.
+#
+# The source of truth is publish/cirrus_data_tracker/release.yml in the private development
+# repository; every publish copies it to .github/workflows/release.yml here, so edit it there.
+#
+# It runs when a version tag (v4.5.0) is pushed. It refuses unless the tag is on main and agrees
+# with the files, then makes a GitHub Release with the plugin and version.json attached, and the
+# changelog section of that version as its notes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag against the files
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$*"; exit 1; }
+          tag="$GITHUB_REF_NAME"
+          ver="${tag#v}"
+          [ "$tag" != "$ver" ] || die "the tag '$tag' does not start with v."
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || die "the tag $tag is not on main."
+          [ -f cirrus_data_tracker.xml ] || die "cirrus_data_tracker.xml is missing."
+          [ -f version.json ] || die "version.json is missing."
+          [ -f CHANGELOG.md ] || die "CHANGELOG.md is missing."
+          plugin_ver=$(sed -n 's/^local PLUGIN_VERSION = "\(.*\)"[[:space:]]*$/\1/p' cirrus_data_tracker.xml | head -n 1)
+          [ "$plugin_ver" = "$ver" ] || die "the tag says $ver but the plugin says '${plugin_ver:-nothing}'."
+          json_ver=$(python3 -c 'import json; print(json.load(open("version.json"))["version"])')
+          [ "$json_ver" = "$ver" ] || die "the tag says $ver but version.json says '$json_ver'."
+          json_sha=$(python3 -c 'import json; print(json.load(open("version.json"))["sha256"])')
+          file_sha=$(sha256sum < cirrus_data_tracker.xml | cut -d' ' -f1)
+          [ "$json_sha" = "$file_sha" ] || die "version.json's sha256 does not match cirrus_data_tracker.xml."
+          echo "Tag $tag matches the plugin ($plugin_ver) and version.json."
+
+      - name: Take this version's notes from the changelog
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '$1 == "##" && $2 == v { f = 1; next } $1 == "##" { f = 0 } f' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $ver' section."
+            exit 1
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" cirrus_data_tracker.xml version.json \
+            --title "Cirrus Data Tracker $ver" \
+            --notes-file notes.md \
+            --verify-tag
