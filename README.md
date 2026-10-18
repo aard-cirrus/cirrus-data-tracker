@@ -20,7 +20,7 @@ list, and `cdt help <topic>` for any topic below.
 - [Damage meter window](#damage-meter-window) (`cdt dmg meter`)
 - [Heals](#heals) (`cdt heal`)
 - [Progress: tier, redo, flags](#progress-tier-redo-flags)
-- [Instinct, mastery and builds](#instinct-mastery-and-builds)
+- [Instinct, mastery, potential and builds](#instinct-mastery-and-builds)
 - [Snapshots, dtrack, gaias and wail](#snapshots-dtrack-gaias-and-wail)
 - [Automatic reports](#automatic-reports) (`cdt events`)
 - [Channel query listener](#channel-query-listener) (`cdt listen`)
@@ -576,6 +576,14 @@ damage %, and costs out training.
 | `cdt mastery benefit` | points → damage % table |
 | `cdt mastery project <pts> <type>` | projected damage gain from adding pts to a damage type (e.g. `fire`) |
 
+### Potential (`cdt potential`)
+
+The QP it costs to raise potential, from the game's cost table (0 to 450).
+
+| Command | What it does |
+|---|---|
+| `cdt potential <from> <to>` | QP to go from→to, e.g. `cdt potential 0 20` is 6,750 QP |
+
 ### Builds (`cdt build`)
 
 Save instinct/mastery setups, compare them, and find the best use of a budget,
@@ -717,6 +725,7 @@ the allowlist (or an allowed clan) get answers.
 | `cdt help` | what they can ask |
 | `cdt instinct <from> <to> [<skill>] [<N>wis]` | trains and gold, plus the benefit |
 | `cdt mastery <from> <to>` | QP, gold and damage % |
+| `cdt potential <from> <to>` | QP to raise potential |
 | `cdt report <dps\|dmg\|crit\|healedme\|healedall\|healedgrp>` | your damage meter table (say, gtell, spouse only) |
 | `cdt report player <name>` | one player's attacks and heals (say, gtell, spouse only) |
 | `cdt customreport <a+b+...> player <name>` | only the figures asked for: dps, dmg, crit, avg, healedme, healedall (say, gtell, spouse only) |

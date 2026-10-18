@@ -2,6 +2,18 @@
 
 Newest first. The database version is shown for each release; an upgrade backs the database up first.
 
+## 4.5.1 - cdt potential
+
+Database version: 39
+
+### Upgrading
+
+- No database change from 4.5.0.
+
+### New
+
+- cdt potential <from> <to> gives the QP cost of raising potential from one value to another, from the game's cost table (0 to 450): cdt potential 0 20 is 6,750 QP. Allowed players can ask it over cdt listen too, as they can cdt instinct and cdt mastery.
+
 ## 4.5.0 - cdt update gets the newest public version
 
 Database version: 39

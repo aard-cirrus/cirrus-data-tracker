@@ -10,11 +10,11 @@
    save_state="y"
    date_written="2026-08-26 00:00:00"
    requires="4.73"
-   version="4.50"
+   version="4.51"
 >
 <description trim="y">
 <![CDATA[
-Cirrus Data Tracker v4.5.0
+Cirrus Data Tracker v4.5.1
 (patch releases put their third number into the plugin `version` attribute as
 a decimal digit -- 3.8.1 was 3.81 -- because MushClient parses it as a number.)
 
@@ -542,6 +542,7 @@ Type 'cdt help' for commands.
   <alias match="^cdt dmg(.*)$" regexp="y" enabled="y" script="CmdDmg" sequence="100"></alias>
   <alias match="^cdt instinct(.*)$" regexp="y" enabled="y" script="CmdInstinct" sequence="100"></alias>
   <alias match="^cdt mastery(.*)$" regexp="y" enabled="y" script="CmdMastery" sequence="100"></alias>
+  <alias match="^cdt potential(.*)$" regexp="y" enabled="y" script="CmdPotential" sequence="100"></alias>
   <alias match="^cdt build(.*)$" regexp="y" enabled="y" script="CmdBuild" sequence="100"></alias>
   <alias match="^cdt db(.*)$" regexp="y" enabled="y" script="CmdDb" sequence="100"></alias>
   <alias match="^cdt gaias(.*)$" regexp="y" enabled="y" script="CmdGaias" sequence="100"></alias>
@@ -586,7 +587,7 @@ local sqlite3 = require("sqlite3")
 -- =============================================================================
 -- CONSTANTS
 -- =============================================================================
-local PLUGIN_VERSION = "4.5.0"
+local PLUGIN_VERSION = "4.5.1"
 local GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"
 local DB_VERSION = 39
 
@@ -1254,7 +1255,7 @@ end
 
 -- The first word of every cdt command, for "did you mean" on a typo.
 CDT_COMMANDS = {
-   "gains", "dmg", "tier", "redo", "build", "instinct", "mastery", "snapshot",
+   "gains", "dmg", "tier", "redo", "build", "instinct", "mastery", "potential", "snapshot",
    "dtrack", "listen", "archive", "export", "config", "gag", "events", "flags",
    "db", "rebuild", "reset", "unstick", "reload", "update", "debug", "version", "help", "toggle", "heal",
 }
@@ -1562,6 +1563,12 @@ function FormatInstinctCostReply(from, to, skill_query, wis)
    return result
 end
 
+function FormatPotentialCostReply(from, to)
+   if from < 0 or from > POTENTIAL_MAX or to < 0 or to > POTENTIAL_MAX or from >= to then return nil end
+   return string.format("@D[@CCDT@D] @wPotential @C%d@D->@C%d@D: @W%s @wQP",
+      from, to, comma_value(PotentialRangeCost(from, to)))
+end
+
 function FormatMasteryCostReply(from, to)
    if from < 0 or from > 1039 or to < 0 or to > 1039 or from >= to then return nil end
    local qp, gold = MasteryRangeCost(from, to)
@@ -1622,6 +1629,13 @@ function HandleListenQuery(chan, player, msg)
       return
    end
 
+   local pot_lo, pot_hi = lower:match("^cdt potential%s+(%d+)%s+(%d+)")
+   if pot_lo then
+      local reply = FormatPotentialCostReply(tonumber(pot_lo), tonumber(pot_hi))
+      if reply then SendChannelLines(send_cmd, reply, true) end
+      return
+   end
+
    local meter_allowed = (chan == "say" or chan == "gtell" or chan == "spouse")
 
    local custom_rest = lower:match("^cdt customreport%s+(.*)")
@@ -1657,7 +1671,8 @@ function HandleListenQuery(chan, player, msg)
       local help = "@D[@CCDT@D] @wCommands: "
          .. "@Ccdt instinct <from> <to> @D(@wcost only@D) @D| "
          .. "@Ccdt instinct <from> <to> <skill> [<N>wis] @D(@wcost + benefit@D) @D| "
-         .. "@Ccdt mastery <from> <to> @D(@wcost + benefit@D)"
+         .. "@Ccdt mastery <from> <to> @D(@wcost + benefit@D) @D| "
+         .. "@Ccdt potential <from> <to> @D(@wQP cost@D)"
       if meter_allowed then
          help = help .. " @D| @Ccdt report <sort> @D(@wdps/dmg/crit/healedme/healedall/healedgrp@D)"
             .. " @D| @Ccdt report healedme|healedall|healedgrp castsonly"
@@ -14443,6 +14458,17 @@ local HELP_TOPICS = {
          {"silver", "                                        using your recorded damage"},
       },
    },
+   potential = {
+      title = "cdt potential",
+      lines = {
+         {"white", " Potential"},
+         {"silver", "   The QP it costs to raise potential, from the game's cost table (0-450)."},
+         {"white", ""},
+         {"white", " Commands"},
+         {"silver", "   cdt potential <from> <to>   : QP to go from->to (cdt potential 0 20)"},
+         {"silver", "   Allowed players can ask the same over cdt listen."},
+      },
+   },
    listen = {
       title = "cdt listen",
       lines = {
@@ -14454,6 +14480,7 @@ local HELP_TOPICS = {
          {"white", " Commands"},
          {"silver", "   cdt listen                      : status, channels and allowlist"},
          {"silver", "   cdt listen <channel> [on|off]   : turn a channel on/off (flips if blank)"},
+         {"silver", "   Queries: cdt instinct, cdt mastery and cdt potential <from> <to>."},
          {"silver", "   cdt listen allow <name>         : add a player"},
          {"silver", "   cdt listen remove <name>        : remove a player"},
          {"silver", "   cdt listen clanallow <clan>     : read 'roster <clan>' and allow all"},
@@ -15267,6 +15294,7 @@ function CmdHelp(name, line, wildcards)
    ColourNote("yellow", "", " Instinct, Mastery & Dtrack")
    ColourNote("cyan", "", "   cdt instinct            ", "dimgray", "", ": ", "silver", "", "Instinct tracking, cost calc, benefit, projection")
    ColourNote("cyan", "", "   cdt mastery             ", "dimgray", "", ": ", "silver", "", "Mastery tracking, cost calc, benefit, projection")
+   ColourNote("cyan", "", "   cdt potential           ", "dimgray", "", ": ", "silver", "", "QP to raise potential from->to")
    ColourNote("cyan", "", "   cdt build               ", "dimgray", "", ": ", "silver", "", "Save/compare/optimize hypothetical builds")
    ColourNote("cyan", "", "   cdt gaias               ", "dimgray", "", ": ", "silver", "", "Shaman gaias focus element")
    ColourNote("cyan", "", "   cdt wail                ", "dimgray", "", ": ", "silver", "", "Your wail: void sermon or a sonic weapon")
@@ -19651,6 +19679,65 @@ function MasteryRangeCost(from, to)
    return qp, gold
 end
 
+-- Potential: the QP to raise it from 0 to N, N = 1..450 (cumulative; the cost of one
+-- step is the difference). Levels 1-150 cost 100 QP and then 25 more each; 151+ 50 more each.
+POTENTIAL_MAX = 450
+POTENTIAL_CUM = {
+   100, 225, 375, 550, 750, 975, 1225, 1500, 1800, 2125,
+   2475, 2850, 3250, 3675, 4125, 4600, 5100, 5625, 6175, 6750,
+   7350, 7975, 8625, 9300, 10000, 10725, 11475, 12250, 13050, 13875,
+   14725, 15600, 16500, 17425, 18375, 19350, 20350, 21375, 22425, 23500,
+   24600, 25725, 26875, 28050, 29250, 30475, 31725, 33000, 34300, 35625,
+   36975, 38350, 39750, 41175, 42625, 44100, 45600, 47125, 48675, 50250,
+   51850, 53475, 55125, 56800, 58500, 60225, 61975, 63750, 65550, 67375,
+   69225, 71100, 73000, 74925, 76875, 78850, 80850, 82875, 84925, 87000,
+   89100, 91225, 93375, 95550, 97750, 99975, 102225, 104500, 106800, 109125,
+   111475, 113850, 116250, 118675, 121125, 123600, 126100, 128625, 131175, 133750,
+   136350, 138975, 141625, 144300, 147000, 149725, 152475, 155250, 158050, 160875,
+   163725, 166600, 169500, 172425, 175375, 178350, 181350, 184375, 187425, 190500,
+   193600, 196725, 199875, 203050, 206250, 209475, 212725, 216000, 219300, 222625,
+   225975, 229350, 232750, 236175, 239625, 243100, 246600, 250125, 253675, 257250,
+   260850, 264475, 268125, 271800, 275500, 279225, 282975, 286750, 290550, 294375,
+   298225, 302125, 306075, 310075, 314125, 318225, 322375, 326575, 330825, 335125,
+   339475, 343875, 348325, 352825, 357375, 361975, 366625, 371325, 376075, 380875,
+   385725, 390625, 395575, 400575, 405625, 410725, 415875, 421075, 426325, 431625,
+   436975, 442375, 447825, 453325, 458875, 464475, 470125, 475825, 481575, 487375,
+   493225, 499125, 505075, 511075, 517125, 523225, 529375, 535575, 541825, 548125,
+   554475, 560875, 567325, 573825, 580375, 586975, 593625, 600325, 607075, 613875,
+   620725, 627625, 634575, 641575, 648625, 655725, 662875, 670075, 677325, 684625,
+   691975, 699375, 706825, 714325, 721875, 729475, 737125, 744825, 752575, 760375,
+   768225, 776125, 784075, 792075, 800125, 808225, 816375, 824575, 832825, 841125,
+   849475, 857875, 866325, 874825, 883375, 891975, 900625, 909325, 918075, 926875,
+   935725, 944625, 953575, 962575, 971625, 980725, 989875, 999075, 1008325, 1017625,
+   1026975, 1036375, 1045825, 1055325, 1064875, 1074475, 1084125, 1093825, 1103575, 1113375,
+   1123225, 1133125, 1143075, 1153075, 1163125, 1173225, 1183375, 1193575, 1203825, 1214125,
+   1224475, 1234875, 1245325, 1255825, 1266375, 1276975, 1287625, 1298325, 1309075, 1319875,
+   1330725, 1341625, 1352575, 1363575, 1374625, 1385725, 1396875, 1408075, 1419325, 1430625,
+   1441975, 1453375, 1464825, 1476325, 1487875, 1499475, 1511125, 1522825, 1534575, 1546375,
+   1558225, 1570125, 1582075, 1594075, 1606125, 1618225, 1630375, 1642575, 1654825, 1667125,
+   1679475, 1691875, 1704325, 1716825, 1729375, 1741975, 1754625, 1767325, 1780075, 1792875,
+   1805725, 1818625, 1831575, 1844575, 1857625, 1870725, 1883875, 1897075, 1910325, 1923625,
+   1936975, 1950375, 1963825, 1977325, 1990875, 2004475, 2018125, 2031825, 2045575, 2059375,
+   2073225, 2087125, 2101075, 2115075, 2129125, 2143225, 2157375, 2171575, 2185825, 2200125,
+   2214475, 2228875, 2243325, 2257825, 2272375, 2286975, 2301625, 2316325, 2331075, 2345875,
+   2360725, 2375625, 2390575, 2405575, 2420625, 2435725, 2450875, 2466075, 2481325, 2496625,
+   2511975, 2527375, 2542825, 2558325, 2573875, 2589475, 2605125, 2620825, 2636575, 2652375,
+   2668225, 2684125, 2700075, 2716075, 2732125, 2748225, 2764375, 2780575, 2796825, 2813125,
+   2829475, 2845875, 2862325, 2878825, 2895375, 2911975, 2928625, 2945325, 2962075, 2978875,
+   2995725, 3012625, 3029575, 3046575, 3063625, 3080725, 3097875, 3115075, 3132325, 3149625,
+   3166975, 3184375, 3201825, 3219325, 3236875, 3254475, 3272125, 3289825, 3307575, 3325375,
+   3343225, 3361125, 3379075, 3397075, 3415125, 3433225, 3451375, 3469575, 3487825, 3506125,
+   3524475, 3542875, 3561325, 3579825, 3598375, 3616975, 3635625, 3654325, 3673075, 3691875,
+}
+
+function PotentialRangeCost(from, to)
+   return PotentialCumQp(to) - PotentialCumQp(from)
+end
+
+function PotentialCumQp(n)
+   return n <= 0 and 0 or POTENTIAL_CUM[n]
+end
+
 function FindInstinctMatch(query)
    local q = query:lower():match("^%s*(.-)%s*$")
    local all_names = {}
@@ -20266,6 +20353,22 @@ function CmdMastery(name, line, wildcards)
          CmdMasteryHelp()
       end
    end
+end
+
+function CmdPotential(name, line, wildcards)
+   local lo, hi = (wildcards[1] or ""):match("^%s*(%d+)%s+(%d+)%s*$")
+   lo, hi = tonumber(lo), tonumber(hi)
+   if not lo or not hi then
+      ColourNote("yellow", "", "[CDT] Usage: cdt potential <from> <to>")
+      ColourNote("silver", "", "  Example: cdt potential 0 20")
+      return
+   end
+   if lo >= hi or hi > POTENTIAL_MAX then
+      ColourNote("yellow", "", "[CDT] Potential goes from a lower to a higher value, up to " .. POTENTIAL_MAX .. ".")
+      return
+   end
+   ColourNote("cyan", "", "[CDT] Potential ", "white", "", tostring(lo), "cyan", "", " -> ", "white", "", tostring(hi),
+      "cyan", "", ": ", "white", "", comma_value(PotentialRangeCost(lo, hi)), "cyan", "", " QP")
 end
 
 function CmdMasteryHelp()
@@ -27423,6 +27526,14 @@ end
 
 -- The change history, newest first: {version, db, title, {{heading, {bullets}}, ...}}.
 CHANGELOG = {
+   {version = "4.5.1", db = 39, title = "cdt potential", sections = {
+      {"Upgrading", {
+         "No database change from 4.5.0.",
+      }},
+      {"New", {
+         "cdt potential <from> <to> gives the QP cost of raising potential from one value to another, from the game's cost table (0 to 450): cdt potential 0 20 is 6,750 QP. Allowed players can ask it over cdt listen too, as they can cdt instinct and cdt mastery.",
+      }},
+   }},
    {version = "4.5.0", db = 39, title = "cdt update gets the newest public version", sections = {
       {"Upgrading", {
          "No database change from 4.4.9.",
