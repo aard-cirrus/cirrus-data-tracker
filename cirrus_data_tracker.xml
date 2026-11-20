@@ -10,11 +10,11 @@
    save_state="y"
    date_written="2026-08-26 00:00:00"
    requires="4.73"
-   version="4.51"
+   version="4.70"
 >
 <description trim="y">
 <![CDATA[
-Cirrus Data Tracker v4.5.1
+Cirrus Data Tracker v4.7.0
 (patch releases put their third number into the plugin `version` attribute as
 a decimal digit -- 3.8.1 was 3.81 -- because MushClient parses it as a number.)
 
@@ -174,6 +174,10 @@ Type 'cdt help' for commands.
   <!-- ==================== BLOOT ==================== -->
   <trigger match="^You get \(+(?&lt;tier&gt;[A-Za-z]+)\)+.* from the .*corpse of (?&lt;corpse&gt;.+)\.$"
     enabled="y" group="cdt_bloot" regexp="y" script="OnBlootLoot" sequence="100"></trigger>
+  <!-- Bloot from skinning: "You craft the cloak further into: (Polished) a protective
+       cloak skinned from a goblin." follows "You make yourself ..." when the skin is bloot. -->
+  <trigger match="^You craft the .+ further into: \(+(?&lt;tier&gt;[A-Za-z]+)\)+ (?&lt;item&gt;.+)\.$"
+    enabled="y" group="cdt_bloot" regexp="y" script="OnSkinBloot" sequence="100"></trigger>
 
   <!-- ==================== COMBAT SPECIALS ==================== -->
   <trigger match="^Your .+ glows brightly and almost decapitates .*\.$"
@@ -587,9 +591,9 @@ local sqlite3 = require("sqlite3")
 -- =============================================================================
 -- CONSTANTS
 -- =============================================================================
-local PLUGIN_VERSION = "4.5.1"
+local PLUGIN_VERSION = "4.7.0"
 local GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"
-local DB_VERSION = 39
+local DB_VERSION = 43
 
 local AUTO_MILESTONE_QP_INTERVAL = 100000
 local AUTO_MILESTONE_PUP_INTERVAL = 10000
@@ -603,6 +607,13 @@ local BLOOT_TIERS = {
 }
 
 local BLOOT_SET = {}
+-- Bloot from skinning, kept apart from bloot_log so drop rates and bloot by area
+-- stay about corpses. mob is what the skin was taken from, as the item names it.
+SKIN_BLOOT_DDL = [[CREATE TABLE IF NOT EXISTS skin_bloot_log (
+   skin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+   tier TEXT NOT NULL, item TEXT DEFAULT '', mob TEXT DEFAULT '', area TEXT DEFAULT '',
+   time INTEGER NOT NULL, session_id INTEGER DEFAULT 0
+)]]
 BLOOT_RANK = {}
 for i, t in ipairs(BLOOT_TIERS) do BLOOT_SET[t] = true; BLOOT_RANK[t] = i end
 
@@ -638,10 +649,6 @@ local default_config = {
    -- Shaman only: which element gaias fury/revenge are focused into.
    -- '' means unfocused, treated as an even mix of the four elements.
    gaias_focus = "",
-   -- Your own 'wail' lines: void sermon (harmer, negative) and sonic weapons share the
-   -- word. "weapon" (all sonic melee), "sermon" (all void sermon) or "both" (told apart
-   -- by your mana dropping by a cast's cost).
-   wail_mode = "weapon",
    -- Automatic reports: whether each prints, where it goes, and for level-ups and
    -- powerups which number the line shows.
    events = {
@@ -1910,6 +1917,8 @@ function db_open()
       return false
    end
    db:exec("PRAGMA journal_mode=WAL;")
+   -- A lock held for a moment (a backup, another reader) waits instead of failing.
+   if db.busy_timeout then pcall(db.busy_timeout, db, 3000) end
    db:exec("PRAGMA synchronous=NORMAL;")
    -- SQLite's default page cache is 2 MB. The meter's queries alone read more than
    -- that, and every page that falls out comes back through the file system, which
@@ -1931,9 +1940,17 @@ function db_exec(sql)
    -- work (so 'cdt db' can report state), but nothing gets written until the
    -- user restores or explicitly chooses to keep the database as-is.
    if migration_blocked then return false end
-   local ok, err = pcall(function() db:exec(sql) end)
+   -- lsqlite3's db:exec returns an error code (sqlite3.OK on success) and does
+   -- not raise, so the code is what says whether the write happened.
+   local ok, rc = pcall(function() return db:exec(sql) end)
+   local err
    if not ok then
-      ColourNote("red", "", "[CDT DB] " .. tostring(err))
+      err = tostring(rc)
+   elseif rc ~= sqlite3.OK then
+      err = tostring(db:errmsg()) .. " (code " .. tostring(rc) .. ")"
+   end
+   if err then
+      ColourNote("red", "", "[CDT DB] " .. err)
       ColourNote("red", "", "[CDT SQL] " .. sql:sub(1, 200))
       return false
    end
@@ -3006,6 +3023,8 @@ HEAL_LOG_DDL = [[CREATE TABLE IF NOT EXISTS heal_log (
 -- by the game, so theirs stay blank. Same level/tier/30-minute slice columns as the
 -- other damage tables, so the cdt dmg filters apply. grouped (v38): 0 you were solo
 -- when it hit you, 1 you were grouped (always, for a groupmate's), -1 not known.
+-- attack_secs and attack_damage (v41, yours only): the seconds the attacker kept
+-- hitting you and the damage done in them, for DPS while attacking you.
 DAMAGE_TAKEN_DDL = [[CREATE TABLE IF NOT EXISTS damage_taken (
          victim TEXT NOT NULL,
          is_self INTEGER NOT NULL DEFAULT 0,
@@ -3026,6 +3045,8 @@ DAMAGE_TAKEN_DDL = [[CREATE TABLE IF NOT EXISTS damage_taken (
          hits INTEGER DEFAULT 0,
          crits INTEGER DEFAULT 0,
          max_hit INTEGER DEFAULT 0,
+         attack_secs INTEGER DEFAULT 0,
+         attack_damage INTEGER DEFAULT 0,
          PRIMARY KEY (victim, attacker, attack_name, class, race, area, level, tier, remort, redo, slice_start, grouped)
       )]]
 
@@ -3624,6 +3645,63 @@ AREA_STATS_DDL = [[CREATE TABLE IF NOT EXISTS area_stats (
    last_kill_time INTEGER DEFAULT 0,
    PRIMARY KEY (area, grouped)
 )]]
+
+-- The v40 repair of double_xp_log (see db_init). true and the number of rows changed,
+-- or false and why. Works on an empty table and on one with only good rows.
+function RepairDoubleLog()
+   if not DbTableExists("main", "double_xp_log") then return true, 0 end
+   local rows, err = db_query("SELECT id, start_time, end_time FROM double_xp_log ORDER BY start_time, id")
+   if rows == false then return false, err end
+   local cur_id = nil
+   if state.current.double_active then
+      for _, r in ipairs(rows) do
+         local id = tonumber(r.id) or 0
+         if not cur_id or id > cur_id then cur_id = id end
+      end
+   end
+   local has_kills = DbTableExists("main", "kills")
+   local fixes = {}
+   for i, r in ipairs(rows) do
+      local id, st, en = tonumber(r.id) or 0, tonumber(r.start_time) or 0, tonumber(r.end_time) or 0
+      local nxt = rows[i + 1] and (tonumber(rows[i + 1].start_time) or 0)
+      local suspect = false
+      if id ~= cur_id then
+         if en == 0 then suspect = true
+         elseif nxt and nxt < en then suspect = true end
+      end
+      if suspect then
+         local we = st
+         if en > 0 and nxt then we = math.min(en, nxt)
+         elseif en > 0 then we = en
+         elseif nxt then we = nxt end
+         local new_end = st
+         if has_kills and we >= st then
+            local k, kerr = db_query(string.format(
+               "SELECT MAX(time) AS t FROM kills WHERE double_active = 1 AND time >= %d AND time <= %d", st, we))
+            if k == false then return false, kerr end
+            local t = k[1] and tonumber(k[1].t)
+            if t and t >= st then new_end = t end
+         end
+         if new_end ~= en then fixes[#fixes + 1] = {id = id, new_end = new_end} end
+      end
+   end
+   if #fixes == 0 then return true, 0 end
+   local good, why = DbRun("BEGIN;")
+   if not good then return false, why end
+   for _, f in ipairs(fixes) do
+      good, why = DbRun(string.format("UPDATE double_xp_log SET end_time = %d WHERE id = %d", f.new_end, f.id))
+      if not good then
+         DbRun("ROLLBACK;")
+         return false, why
+      end
+   end
+   good, why = DbRun("COMMIT;")
+   if not good then
+      DbRun("ROLLBACK;")
+      return false, why
+   end
+   return true, #fixes
+end
 
 function db_init()
    if not db_open() then return false end
@@ -4652,6 +4730,75 @@ function db_init()
       version = 39
    end
 
+   if version == 39 then
+      -- Before 4.3.1 the end of a double often wasn't saved, so rows stayed open and
+      -- a later end closed several at once: periods that overlap the next one. Each
+      -- suspect row now ends at its last double-XP kill inside its own window (or has
+      -- no length when there is none). The double running now, if any, is left alone.
+      local ok, repaired = RepairDoubleLog()
+      if not ok then
+         ColourNote("red", "", "[CDT] v39->v40 migration failed: " .. tostring(repaired))
+         ColourNote("red", "", "[CDT] Database left at v39. Use 'cdt db restore' to roll back.")
+         migration_blocked = true
+         return true
+      end
+      db_exec("PRAGMA user_version=40;")
+      ColourNote("cyan", "", string.format("[CDT] Database migrated from v39 to v40 (double XP log: %d period%s repaired)",
+         repaired, repaired == 1 and "" or "s"))
+      version = 40
+   end
+
+   if version == 40 then
+      -- Timing for DPS while attacking you. Older rows stay at 0: their seconds were never
+      -- recorded. A database that reached damage_taken after this DDL has them already.
+      local ok = true
+      if DbTableExists("main", "damage_taken") then
+         for _, col in ipairs({"attack_secs", "attack_damage"}) do
+            if not ColumnExists("damage_taken", col) then
+               ok = db_exec("ALTER TABLE damage_taken ADD COLUMN " .. col .. " INTEGER DEFAULT 0;") and ok
+            end
+         end
+      end
+      if not ok then
+         ColourNote("red", "", "[CDT] v40->v41 migration failed: could not add the timing columns")
+         ColourNote("red", "", "[CDT] Database left at v40. Use 'cdt db restore' to roll back.")
+         migration_blocked = true
+         return true
+      end
+      db_exec("PRAGMA user_version=41;")
+      ColourNote("cyan", "", "[CDT] Database migrated from v40 to v41 (timing for damage taken)")
+      version = 41
+   end
+
+   if version == 41 then
+      -- void sermon's damage line changed from 'wail' to 'sermon' in November 2026. What
+      -- was recorded under 'sermon' since (an unknown damage type) is filed under void sermon.
+      local moved = FoldRenamedAttack("sermon", "void sermon", "negative", "spell")
+      if not moved then
+         ColourNote("red", "", "[CDT] v41->v42 migration failed and was rolled back.")
+         ColourNote("red", "", "[CDT] Database left at v41. Use 'cdt db restore' to roll back.")
+         migration_blocked = true
+         return true
+      end
+      db_exec("PRAGMA user_version=42;")
+      ColourNote("cyan", "", string.format("[CDT] Database migrated from v41 to v42 (%d 'sermon' row%s filed under void sermon)",
+         moved, moved == 1 and "" or "s"))
+      version = 42
+   end
+
+   if version == 42 then
+      -- Bloot from skinning gets its own log.
+      if not db_exec(SKIN_BLOOT_DDL .. ";") then
+         ColourNote("red", "", "[CDT] v42->v43 migration failed: could not create the skinning bloot log")
+         ColourNote("red", "", "[CDT] Database left at v42. Use 'cdt db restore' to roll back.")
+         migration_blocked = true
+         return true
+      end
+      db_exec("PRAGMA user_version=43;")
+      ColourNote("cyan", "", "[CDT] Database migrated from v42 to v43 (bloot from skinning)")
+      version = 43
+   end
+
    if version < DB_VERSION then
       db_exec([[CREATE TABLE IF NOT EXISTS sessions (
          session_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4864,6 +5011,7 @@ function db_init()
          tier TEXT NOT NULL, corpse TEXT DEFAULT '', area TEXT DEFAULT '',
          time INTEGER NOT NULL, session_id INTEGER DEFAULT 0
       );]])
+      db_exec(SKIN_BLOOT_DDL .. ";")
 
       db_exec([[CREATE TABLE IF NOT EXISTS tracked_sessions (
          track_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5567,12 +5715,21 @@ function FindEarliestVerb(lower)
    return best_pos, best_len
 end
 
+-- Damage words the game renamed, and the name CDT files them under. void sermon
+-- printed 'wail', the same word as a sonic weapon, until November 2026; it now
+-- prints 'sermon'. Stored names are lower case keys here.
+ATTACK_RENAMES = {sermon = "void sermon"}
+
+function RenamedAttack(attack)
+   return attack and ATTACK_RENAMES[attack:lower()] or attack
+end
+
 function ExtractAttackName(text)
    local stripped = StripVerbDecorations(text)
    local best_pos = FindEarliestVerb(stripped:lower())
    if not best_pos then return nil end
    local before = stripped:sub(1, best_pos - 1):match("^(.-)%s+$")
-   if before and #before > 0 then return before end
+   if before and #before > 0 then return RenamedAttack(before) end
    return nil
 end
 
@@ -5769,7 +5926,7 @@ function FoldBrokenSessionAttacks()
       if type(atks) ~= "table" then return end
       local moves = {}
       for name in pairs(atks) do
-         local fixed = ExtractAttackName(name)
+         local fixed = ATTACK_RENAMES[name:lower()] or ExtractAttackName(name)
          if fixed and fixed ~= name then moves[#moves + 1] = {name, fixed} end
       end
       for _, mv in ipairs(moves) do
@@ -5791,6 +5948,126 @@ function FoldBrokenSessionAttacks()
    for _, sg in pairs(state.session.group_dmg or {}) do fold(sg.attacks) end
    if folded > 0 then state_save() end
    return folded
+end
+
+-- The tables that hold damage by attack name, and how a row's figures add up when
+-- two rows meet: summed, the larger kept, or the smaller kept.
+ATTACK_RENAME_TABLES = {
+   {tbl = "attack_stats", sum = {"total_damage", "total_hits", "total_crits", "precise_hits", "precise_damage"},
+    max = {"combat_secs", "max_hit"}, min = {"min_hit"}},
+   {tbl = "player_attack_stats", sum = {"total_damage", "total_hits", "total_crits", "precise_hits", "precise_damage"},
+    max = {"combat_secs", "max_hit", "last_seen"}, min = {"min_hit"}},
+   {tbl = "damage_taken", sum = {"total_damage", "lines", "hits", "crits", "attack_secs", "attack_damage"},
+    max = {"max_hit"}, min = {}},
+   {tbl = "snapshot_dmg_baseline", sum = {"total_damage"}, max = {}, min = {}},
+}
+
+-- Files every row stored under the attack name `old` under `new` instead, with new's
+-- damage type and category where old's were unknown. A row that meets one already
+-- under `new` (same key otherwise) is added into it. Rows are matched on each table's
+-- whole primary key, read from the table itself. Their damage moves to the new type in
+-- damtype_stats (damage under an unknown type never reached it, so is only added).
+-- opts: tables = {name = true} to touch only those; before = only rows in slices that
+-- start before this time; class = only rows recorded as this subclass (tables without
+-- that column are then left out); force = take the new damage type and category even
+-- where old's were known; extra = a function run inside the same transaction, false to
+-- roll back. The number of rows moved, or nil after rolling everything back.
+function FoldRenamedAttack(old, new, damtype, category, opts)
+   if not db then return nil end
+   opts = opts or {}
+   local O, N, DT, CAT = fixsql(old:lower()), fixsql(new), fixsql(damtype), fixsql(category)
+   local moved = 0
+   local function wanted(t) return not opts.tables or opts.tables[t] end
+   local function slices(alias)
+      return (opts.before and string.format(" AND %sslice_start < %d", alias, opts.before) or "") ..
+         (opts.class and string.format(" AND %sclass = %s COLLATE NOCASE", alias, fixsql(opts.class)) or "")
+   end
+   if not db_exec("BEGIN;") then return nil end
+   local function fail() db_exec("ROLLBACK;") return nil end
+
+   if wanted("attack_stats") and DbTableExists("main", "attack_stats") and DbTableExists("main", "damtype_stats") then
+      local keys = {"class", "level", "tier", "remort", "redo", "slice_start", "grouped"}
+      local src = "FROM attack_stats b WHERE lower(b.attack_name) = " .. O .. " AND b.damtype <> " .. DT ..
+         " AND COALESCE(b.category, '') <> 'epic'" .. slices("b.")
+      local match = {}
+      for _, k in ipairs(keys) do match[#match + 1] = "b." .. k .. " = damtype_stats." .. k end
+      match = table.concat(match, " AND ")
+      local same_type = match .. " AND b.damtype = damtype_stats.damtype"
+      local key_cols = table.concat(keys, ", ")
+      if not db_exec(string.format("UPDATE damtype_stats SET " ..
+            "total_damage = MAX(0, total_damage - (SELECT COALESCE(SUM(b.total_damage), 0) %s AND %s)), " ..
+            "total_hits = MAX(0, total_hits - (SELECT COALESCE(SUM(b.total_hits), 0) %s AND %s)) " ..
+            "WHERE damtype <> %s AND EXISTS (SELECT 1 %s AND %s)",
+            src, same_type, src, same_type, DT, src, same_type))
+         or not db_exec(string.format("INSERT OR IGNORE INTO damtype_stats (damtype, %s, total_damage, combat_secs, total_hits) " ..
+            "SELECT DISTINCT %s, %s, 0, 0, 0 %s", key_cols, DT, key_cols, src))
+         or not db_exec(string.format("UPDATE damtype_stats SET " ..
+            "total_damage = total_damage + (SELECT COALESCE(SUM(b.total_damage), 0) %s AND %s), " ..
+            "total_hits = total_hits + (SELECT COALESCE(SUM(b.total_hits), 0) %s AND %s), " ..
+            "combat_secs = MAX(combat_secs, (SELECT COALESCE(MAX(b.combat_secs), 0) %s AND %s)) " ..
+            "WHERE damtype = %s AND EXISTS (SELECT 1 %s AND %s)",
+            src, match, src, match, src, match, DT, src, match)) then
+         return fail()
+      end
+   end
+
+   for _, spec in ipairs(ATTACK_RENAME_TABLES) do
+      local t = spec.tbl
+      local pk, has = {}, {}
+      if wanted(t) and DbTableExists("main", t) then
+         for _, c in ipairs(db_query("PRAGMA table_info(" .. t .. ");")) do
+            has[c.name] = true
+            if (tonumber(c.pk) or 0) > 0 and c.name ~= "attack_name" then pk[#pk + 1] = c.name end
+         end
+      end
+      if has.attack_name and (not opts.before or has.slice_start) and (not opts.class or has.class) then
+         local m_upd, m_del = {}, {}
+         for _, k in ipairs(pk) do
+            m_upd[#m_upd + 1] = "b." .. k .. " = " .. t .. "." .. k
+            m_del[#m_del + 1] = "g." .. k .. " = " .. t .. "." .. k
+         end
+         local function joined(list) return #list > 0 and (" AND " .. table.concat(list, " AND ")) or "" end
+         local function sub(c, agg_default)
+            return string.format("(SELECT COALESCE(b.%s, %s) FROM %s b WHERE lower(b.attack_name) = %s%s)",
+               c, agg_default, t, O, joined(m_upd))
+         end
+         local mine = slices("")
+         local cnt = db_query_one(string.format("SELECT COUNT(*) AS n FROM %s WHERE lower(attack_name) = %s%s", t, O, mine))
+         moved = moved + (tonumber(cnt and cnt.n) or 0)
+         local sets = {}
+         for _, c in ipairs(spec.sum) do
+            if has[c] then sets[#sets + 1] = string.format("%s = COALESCE(%s, 0) + %s", c, c, sub(c, "0")) end
+         end
+         for _, c in ipairs(spec.max) do
+            if has[c] then sets[#sets + 1] = string.format("%s = MAX(COALESCE(%s, 0), %s)", c, c, sub(c, "0")) end
+         end
+         for _, c in ipairs(spec.min) do
+            if has[c] then sets[#sets + 1] = string.format("%s = MIN(COALESCE(%s, 999999999), %s)", c, c, sub(c, "999999999")) end
+         end
+         local renames = {"attack_name = " .. N}
+         if has.damtype then
+            renames[#renames + 1] = opts.force and ("damtype = " .. DT) or
+               ("damtype = CASE WHEN COALESCE(damtype, 'unknown') = 'unknown' THEN " .. DT .. " ELSE damtype END")
+         end
+         if has.category then
+            renames[#renames + 1] = opts.force and ("category = " .. CAT) or
+               ("category = CASE WHEN COALESCE(category, 'unknown') = 'unknown' THEN " .. CAT .. " ELSE category END")
+         end
+         if (#sets > 0 and not db_exec(string.format(
+               "UPDATE %s SET %s WHERE attack_name = %s AND EXISTS (SELECT 1 FROM %s b WHERE lower(b.attack_name) = %s%s%s)",
+               t, table.concat(sets, ", "), N, t, O, slices("b."), joined(m_upd))))
+            or not db_exec(string.format(
+               "DELETE FROM %s WHERE lower(attack_name) = %s%s AND EXISTS (SELECT 1 FROM %s g WHERE g.attack_name = %s%s)",
+               t, O, mine, t, N, joined(m_del)))
+            or not db_exec(string.format("UPDATE %s SET %s WHERE lower(attack_name) = %s%s",
+               t, table.concat(renames, ", "), O, mine)) then
+            return fail()
+         end
+      end
+   end
+   if opts.extra and not opts.extra() then return fail() end
+   if not db_exec("COMMIT;") then return fail() end
+   return moved
 end
 
 local combat_round_threshold = 10
@@ -6095,8 +6372,6 @@ function SetCurrentLevel(level)
 end
 
 function FlushCombatBuffer()
-   -- wail hits still waiting for a mana update go in first, as weapon hits
-   if wail_pending and #wail_pending > 0 then ResolveWailPending("flush") end
    if not db then return end
    local now = os.time()
    local slice = DamageSliceStart()
@@ -7081,72 +7356,6 @@ function OnHealedBy(name, line, wildcards)
    DebugNote(string.format("Healed by %s's %s: %d", player, spell, amount))
 end
 
--- =============================================================================
--- Your 'wail': the harmer spell void sermon prints its damage as "Your wail ...", the
--- same word a sonic weapon uses. cdt wail says which yours is: all one, all the
--- other, or "both", where a wail line is held until the next GMCP mana update and
--- counts as void sermon if your mana dropped by a cast's cost. Mana given back in
--- the meantime (consume, regen) hides a cast, so "both" comes with a warning.
--- Groupmates' and mobs' wail is always a sonic weapon.
--- =============================================================================
-WAIL_SERMON_COST = 80          -- void sermon's base mana cost; Eldar pay 25% less
-WAIL_HOLD_SECS = 1.5           -- longest a wail line waits for a mana update
-WAIL_MODES = {weapon = true, sermon = true, both = true}
-wail_pending = {}              -- your held wail hits, in the order they arrived
-wail_last_mana = nil           -- your mana in the last char.vitals
-wail_seq = 0                   -- the newest hold timer; an older one does nothing
-
-function WailMode()
-   local m = config.wail_mode
-   return WAIL_MODES[m] and m or "weapon"
-end
-
-function WailSermonCost()
-   if (state.current.race or ""):lower() == "eldar" then return WAIL_SERMON_COST * 0.75 end
-   return WAIL_SERMON_COST
-end
-
--- Records the held wail hits. mana_now (from a char.vitals) decides them: each drop
--- of a cast's cost since the first was held is one void sermon, given to the hits
--- with the biggest damage per hit (a spell hits harder than a weapon). Without it
--- (timer, flush, mode change) they're weapon hits. The queue is emptied first:
--- recording can start a new fight, which flushes.
-function ResolveWailPending(reason, seq, mana_now)
-   if seq and seq ~= wail_seq then return end
-   if #wail_pending == 0 then return end
-   local held = wail_pending
-   wail_pending = {}
-   wail_seq = wail_seq + 1
-   local before = held[1].mana_before
-   local drop = (before and mana_now) and (before - mana_now) or 0
-   local casts = math.max(0, math.floor(drop / WailSermonCost()))
-   local order = {}
-   for i = 1, #held do order[i] = i end
-   table.sort(order, function(a, b)
-      local x, y = held[a].damage / held[a].hits, held[b].damage / held[b].hits
-      if x ~= y then return x > y end
-      return a < b
-   end)
-   local sermon = {}
-   for i = 1, math.min(casts, #held) do sermon[order[i]] = true end
-   for i, h in ipairs(held) do
-      local attack = sermon[i] and "void sermon" or "wail"
-      RecordSelfDamageDealt(attack, h.damage, h.is_crit, h.hits, h.target)
-      DebugNote(string.format("Dmg dealt: %s [%d] x%d%s (wail, %s)", attack, h.damage, h.hits,
-         h.is_crit and " CRIT" or "", mana_now and string.format("mana %+d", -drop) or reason))
-   end
-end
-
--- Every char.vitals: settles held wail hits against the new mana, then remembers it.
-function WailOnVitals()
-   local ok, v = pcall(gmcp, "char.vitals")
-   if not ok or type(v) ~= "table" then return end
-   local mana = tonumber(v.mana)
-   if not mana then return end
-   if #wail_pending > 0 then ResolveWailPending("vitals", nil, mana) end
-   wail_last_mana = mana
-end
-
 function OnSelfDamageDealt(name, line, wildcards)
    local damage, is_crit = ExtractDamageInfo(line)
    if damage <= 0 then return end
@@ -7155,21 +7364,6 @@ function OnSelfDamageDealt(name, line, wildcards)
    local attack = ExtractAttackName(clean)
    if not attack then return end
    local hits = ExtractHitCount(line)
-   if attack:lower() == "wail" then
-      local mode = WailMode()
-      if mode == "sermon" then
-         attack = "void sermon"
-      elseif mode == "both" then
-         wail_pending[#wail_pending + 1] = {damage = damage, is_crit = is_crit, hits = hits,
-            target = ExtractDamageTarget(clean), mana_before = wail_last_mana}
-         if #wail_pending == 1 then
-            DoAfterSpecial(WAIL_HOLD_SECS, string.format("ResolveWailPending('timeout', %d)", wail_seq), 12)
-         end
-         DebugNote(string.format("Dmg dealt: wail [%d] x%d%s, held for the next mana update", damage, hits,
-            is_crit and " CRIT" or ""))
-         return
-      end
-   end
    RecordSelfDamageDealt(attack, damage, is_crit, hits, ExtractDamageTarget(clean))
    DebugNote(string.format("Dmg dealt: %s [%d] x%d%s", attack, damage, hits, is_crit and " CRIT" or ""))
 end
@@ -7182,10 +7376,12 @@ function ParseHitLine(line)
    if not prefix then return nil end
    local attacker, attack = prefix:match("^(.*)'s? (.+)$")
    if not attacker or attacker == "" then return nil end
-   return attacker, attack, ExtractDamageTarget(s)
+   return attacker, RenamedAttack(attack), ExtractDamageTarget(s)
 end
 
 taken_buffer = {}
+-- Each attacker's current run of hits on you: {start = first second, last = latest}.
+taken_bouts = {}
 
 function BufferTaken(victim, is_self, attacker, attack, damage, hits, is_crit)
    local cls, race, lvl, tier, remort, redo = "", "", 0, -1, -1, -1
@@ -7204,8 +7400,21 @@ function BufferTaken(victim, is_self, attacker, attack, damage, hits, is_crit)
       r = {victim = victim, is_self = is_self and 1 or 0, attacker = attacker, attack = attack,
            damtype = (LookupDamtype(attack)), class = cls, race = race, area = area, level = lvl,
            tier = tier, remort = remort, redo = redo, slice = slice, grouped = grouped,
-           dmg = 0, lines = 0, hits = 0, crits = 0, max = 0}
+           dmg = 0, lines = 0, hits = 0, crits = 0, max = 0, secs = 0, timed = 0}
       taken_buffer[key] = r
+   end
+   if is_self then
+      -- Time runs from their first round on, so that round's damage isn't in the rate:
+      -- it has no seconds of its own. A gap over the round threshold starts a new run.
+      local now, bout = os.time(), taken_bouts[attacker]
+      if bout and now - bout.last <= combat_round_threshold then
+         if now > bout.start then
+            r.secs, r.timed = r.secs + (now - bout.last), r.timed + damage
+         end
+         bout.last = now
+      else
+         taken_bouts[attacker] = {start = now, last = now}
+      end
    end
    r.dmg, r.lines, r.hits = r.dmg + damage, r.lines + 1, r.hits + (hits or 1)
    if is_crit then r.crits = r.crits + 1 end
@@ -7226,11 +7435,16 @@ function FlushTakenBuffer()
          fixsql(r.victim), r.is_self, fixsql(r.attacker), fixsql(r.attack), fixsql(r.damtype or "unknown"),
          fixsql(r.class), fixsql(r.race), fixsql(r.area), r.level, r.tier, r.remort, r.redo, r.slice, r.grouped))
       db_exec(string.format("UPDATE damage_taken SET total_damage = total_damage + %d, lines = lines + %d, " ..
-         "hits = hits + %d, crits = crits + %d, max_hit = MAX(max_hit, %d) WHERE %s",
-         r.dmg, r.lines, r.hits, r.crits, r.max, keyw))
+         "hits = hits + %d, crits = crits + %d, max_hit = MAX(max_hit, %d), " ..
+         "attack_secs = attack_secs + %d, attack_damage = attack_damage + %d WHERE %s",
+         r.dmg, r.lines, r.hits, r.crits, r.max, r.secs, r.timed, keyw))
    end
    db_exec("COMMIT;")
    taken_buffer = {}
+   local now = os.time()
+   for who, bout in pairs(taken_bouts) do
+      if now - bout.last > combat_round_threshold then taken_bouts[who] = nil end
+   end
 end
 
 function OnSelfDamageReceived(name, line, wildcards)
@@ -8589,7 +8803,6 @@ function OnPluginBroadcast(msg, id, name, text)
       local ok, data = pcall(gmcp, text)
       if ok then GroupLog(text, data) end
    end
-   if text == "char.vitals" then WailOnVitals() end
 
    if text == "char.status" then
       local ok, data = pcall(gmcp, "char.status")
@@ -9273,6 +9486,21 @@ function OnBlootLoot(name, line, wildcards)
          os.time(), state.session.id))
    end
    DebugNote("Bloot: " .. tier)
+end
+
+-- A skin crafted into bloot. Counted in the skinning bloot log only, not with drops.
+function OnSkinBloot(name, line, wildcards)
+   local tier = wildcards.tier
+   if not BLOOT_SET[tier] then return end
+   local item = wildcards.item or ""
+   local mob = item:match(" skinned from (.+)$") or ""
+   if db then
+      db_exec(string.format(
+         "INSERT INTO skin_bloot_log (tier, item, mob, area, time, session_id) VALUES (%s, %s, %s, %s, %d, %d)",
+         fixsql(tier), fixsql(item), fixsql(mob), fixsql(state.current.area or ""),
+         os.time(), state.session.id or 0))
+   end
+   DebugNote("Skinned bloot: " .. tier)
 end
 
 function OnVorpal(n, l, w) AddKillSpecial("vorpal") end
@@ -14120,20 +14348,15 @@ local HELP_TOPICS = {
    wail = {
       title = "cdt wail",
       lines = {
-         {"white", " Wail: void sermon or a sonic weapon"},
-         {"silver", "   The harmer spell void sermon shows its damage as 'Your wail ...', the"},
-         {"silver", "   same word a sonic weapon uses. Tell the plugin which yours is:"},
-         {"silver", "   cdt wail              : current setting"},
-         {"silver", "   cdt wail weapon       : all wail is a melee weapon hit, sonic (default)"},
-         {"silver", "   cdt wail sermon       : all wail is void sermon, negative"},
-         {"silver", "   cdt wail both         : each wail line is void sermon if your mana drops"},
-         {"silver", "                           by a cast's cost (80, Eldar 60) by the next mana"},
-         {"silver", "                           update, and a weapon hit if it doesn't"},
-         {"silver", "   'both' needs nothing else to give you mana while you fight: consume"},
-         {"silver", "   (corpses for mana) or regen hides a cast, and another spell cast at"},
-         {"silver", "   the same moment can make a weapon hit count as void sermon."},
-         {"silver", "   Groupmates' wail, and a mob's wail on you, are always a sonic weapon."},
-         {"silver", "   Damage already recorded keeps the name and type it was given."},
+         {"white", " Wail and void sermon"},
+         {"silver", "   void sermon's damage line is 'sermon', recorded as void sermon"},
+         {"silver", "   (negative, spell). Wail is always a sonic weapon. cdt wail, which told"},
+         {"silver", "   the two apart when void sermon printed 'wail', is no longer needed."},
+         {"silver", "   cdt wail relabel [confirm] : files your wail as a harmer from before"},
+         {"silver", "                                2026-11-10 under void sermon, for when you"},
+         {"silver", "                                never used a sonic weapon as a harmer. Shows"},
+         {"silver", "                                what would move; confirm does it, after a"},
+         {"silver", "                                backup. Other subclasses' wail stays."},
       },
    },
    dtrack = {
@@ -14616,6 +14839,7 @@ local HELP_TOPICS = {
          {"silver", "            bonus trains, HP/MP/MV, per hour; total levels (all time)"},
          {"silver", "   powerup  the same for powerups, with lifetime powerups (pup also works)"},
          {"silver", "   bloot    bonus loot by tier (best first), 1 per how many kills, by area"},
+         {"silver", "            then skinned bloot, counted on its own"},
          {"silver", "   tp       trivia points from quests, campaigns, GQs, trivia mobs and"},
          {"silver", "            anything else; TP per hour"},
          {"silver", "   trains   trains from level-ups and powerups (base, lucky, blessing,"},
@@ -15297,7 +15521,7 @@ function CmdHelp(name, line, wildcards)
    ColourNote("cyan", "", "   cdt potential           ", "dimgray", "", ": ", "silver", "", "QP to raise potential from->to")
    ColourNote("cyan", "", "   cdt build               ", "dimgray", "", ": ", "silver", "", "Save/compare/optimize hypothetical builds")
    ColourNote("cyan", "", "   cdt gaias               ", "dimgray", "", ": ", "silver", "", "Shaman gaias focus element")
-   ColourNote("cyan", "", "   cdt wail                ", "dimgray", "", ": ", "silver", "", "Your wail: void sermon or a sonic weapon")
+   ColourNote("cyan", "", "   cdt wail                ", "dimgray", "", ": ", "silver", "", "Retired: void sermon is now 'sermon'")
    ColourNote("cyan", "", "   cdt dtrack              ", "dimgray", "", ": ", "silver", "", "Capture dtrack hits breakdown")
    ColourNote("cyan", "", "   cdt snapshot            ", "dimgray", "", ": ", "silver", "", "Capture all + list/show/compare snapshots")
    ColourNote("yellow", "", " Progress")
@@ -15949,7 +16173,7 @@ function CmdDmg(name, line, wildcards)
       ColourNote("cyan", "", "   cdt dmg attacks           ", "dimgray", "", ": ", "silver", "", "Per-attack breakdown by DPS")
       ColourNote("cyan", "", "   cdt dmg types             ", "dimgray", "", ": ", "silver", "", "Per-damage-type breakdown")
       ColourNote("cyan", "", "   cdt dmg level [n]         ", "dimgray", "", ": ", "silver", "", "Damage per level, or one level's lines")
-      ColourNote("cyan", "", "   cdt dmg player <name>     ", "dimgray", "", ": ", "silver", "", "Scouting report for a player")
+      ColourNote("cyan", "", "   cdt dmg player <name>     ", "dimgray", "", ": ", "silver", "", "Report on a player, with their damage to you")
       ColourNote("cyan", "", "   cdt dmg players           ", "dimgray", "", ": ", "silver", "", "Summary of all observed players")
       ColourNote("cyan", "", "   cdt dmg taken [player <n>|players]", "dimgray", "", ": ", "silver", "", "Damage taken")
       ColourNote("cyan", "", "   cdt dmg map               ", "dimgray", "", ": ", "silver", "", "List attack damage type mappings")
@@ -16018,7 +16242,7 @@ ARCHIVE_TABLES = {
       {"sessions", "start_time"}, {"levels", "end_time"}, {"kills", "time"},
       {"quests", "end_time"}, {"campaigns", "end_time"}, {"gquests", "end_time"},
       {"earnings", "time"}, {"gold_log", "time"}, {"bloot_log", "time"},
-      {"deaths", "time"}, {"unfinished_fights", "time"}, {"double_xp_log", "start_time"},
+      {"skin_bloot_log", "time"}, {"deaths", "time"}, {"unfinished_fights", "time"}, {"double_xp_log", "start_time"},
       {"tracked_sessions", "start_time"}, {"daily_totals", "date"},
    },
    dmg = {
@@ -18930,6 +19154,66 @@ function PlayerRecentDay(pname, where)
    end
 end
 
+-- Their hits on you, from damage_taken: any player, grouped with you or not. nil if none.
+function PlayerHitsOnYou(pname, where)
+   if not DbTableExists("main", "damage_taken") then return nil end
+   FlushTakenBuffer()
+   local t = db_query_one(string.format("SELECT SUM(total_damage) AS d, SUM(hits) AS h, MAX(max_hit) AS mx, " ..
+      "MAX(slice_start) AS s, SUM(attack_secs) AS secs, SUM(attack_damage) AS timed " ..
+      "FROM damage_taken WHERE is_self = 1 AND attacker = %s COLLATE NOCASE" .. (where or ""), fixsql(pname)))
+   if not t or (tonumber(t.d) or 0) <= 0 then return nil end
+   return t
+end
+
+function PlayerDamageToYou(pname, where)
+   local t = PlayerHitsOnYou(pname, where)
+   if not t then return end
+   local total, hits = tonumber(t.d) or 0, tonumber(t.h) or 0
+   local function row(label, value, color)
+      ColourNote("silver", "", string.format(" %-22s", label), color or "white", "", tostring(value))
+   end
+   ColourNote("orange", "", string.rep("-", 80))
+   ColourNote("gold", "", " " .. pname .. "'s Damage To You")
+   ColourNote("orange", "", string.rep("-", 80))
+   row("Total Damage", comma_value(total), "lime")
+   row("Total Hits", comma_value(hits))
+   if hits > 0 then row("Average Hit", comma_value(math.floor(total / hits + 0.5))) end
+   row("Biggest Hit", comma_value(tonumber(t.mx) or 0), "yellow")
+   local slice = tonumber(t.s) or 0
+   if slice > 0 then
+      -- damage_taken keeps 30-minute slices, so this is the slice, not the second
+      row("Last Hit", ShowDate("%Y-%m-%d %H:%M", slice) .. "-" .. ShowDate("%H:%M", slice + DAMAGE_SLICE_SECS), "gray")
+   end
+   ColourNote("orange", "", string.rep("-", 80))
+   ColourNote("gray", "", string.format(" %-30s%-10s%12s%9s%10s%7s", "Attack", "Type", "Damage", "Hits", "Biggest", "Share"))
+   local rows = db_query(string.format("SELECT attack_name, MAX(damtype) AS dt, SUM(total_damage) AS d, SUM(hits) AS h, " ..
+      "MAX(max_hit) AS mx FROM damage_taken WHERE is_self = 1 AND attacker = %s COLLATE NOCASE" .. (where or "") ..
+      " GROUP BY attack_name ORDER BY d DESC", fixsql(pname)))
+   for i = 1, math.min(10, #rows) do
+      local r = rows[i]
+      local d = tonumber(r.d) or 0
+      ColourNote("cyan", "", string.format(" %-30s", (r.attack_name or "?"):sub(1, 29)),
+         "silver", "", string.format("%-10s", (r.dt or "?"):sub(1, 9)),
+         "white", "", string.format("%12s%9s%10s", comma_value(d), comma_value(tonumber(r.h) or 0), comma_value(tonumber(r.mx) or 0)),
+         "silver", "", string.format("%7s", SharePct(d, total)))
+   end
+   if #rows > 10 then ColourNote("dimgray", "", string.format(" ... and %d more", #rows - 10)) end
+   ColourNote("orange", "", string.rep("-", 80))
+   ColourNote("gold", "", " DPS While Attacking You")
+   ColourNote("orange", "", string.rep("-", 80))
+   local secs, timed = tonumber(t.secs) or 0, tonumber(t.timed) or 0
+   if secs > 0 then
+      row("DPS", string.format("%.1f", timed / secs), "cyan")
+      row("Time Attacking You", FormatTime(secs))
+      row("Damage In That Time", comma_value(timed), "lime")
+      ColourNote("dimgray", "", " Only damage since v4.6.0 has timing, so older damage isn't in this DPS.")
+   else
+      row("DPS", "--", "cyan")
+      row("Time Attacking You", "--")
+      ColourNote("dimgray", "", " No timed hits yet. Timing starts with v4.6.0.")
+   end
+end
+
 function CmdDmgPlayer(name, line, wildcards)
    local f = DmgViewFilter(wildcards, {grouped = "refuse"})
    if not f then return end
@@ -18946,15 +19230,17 @@ function CmdDmgPlayer(name, line, wildcards)
       "MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen " ..
       "FROM player_profiles WHERE player=%s COLLATE NOCASE" .. f.sql .. " GROUP BY player COLLATE NOCASE", fixsql(pname)))
    if not profile then
-      -- A groupmate who only heals has no damage, but their heals are still worth showing.
+      -- A groupmate who only heals has no damage, and a stranger who attacks you was never
+      -- tracked as one, but their heals and their hits on you are still worth showing.
       local healed = DbTableExists("main", "heal_log") and db_query_one(string.format(
          "SELECT COUNT(*) AS n FROM heal_log WHERE self = 0 AND healer = %s COLLATE NOCASE" .. f.sql, fixsql(pname)))
-      if healed and (tonumber(healed.n) or 0) > 0 then
+      if (healed and (tonumber(healed.n) or 0) > 0) or PlayerHitsOnYou(pname, f.sql) then
          ColourNote("orange", "", string.rep("-", 80))
          ColourNote("gold", "", " Player Scouting: " .. pname)
          ColourNote("orange", "", string.rep("-", 80))
-         ColourNote("dimgray", "", " No damage recorded" .. (f.active and " for that filter." or "."))
+         ColourNote("dimgray", "", " No damage recorded as a groupmate" .. (f.active and " for that filter." or "."))
          PlayerHealsOnYou(pname, f.sql)
+         PlayerDamageToYou(pname, f.sql)
          ColourNote("orange", "", string.rep("-", 80))
          DmgFilterNote(f)
          return
@@ -18997,6 +19283,7 @@ function CmdDmgPlayer(name, line, wildcards)
    ColourNote("white", "", " Damage types")
    DamtypeShareLines(split.types, split.total, 0)
    PlayerHealsOnYou(pname, f.sql)
+   PlayerDamageToYou(pname, f.sql)
    PlayerRecentDay(pname, f.sql)
    DmgFilterNote(f)
 
@@ -19491,7 +19778,7 @@ local INSTINCT_ATTACK_SPELLS = {
    ["earthen hammer"] = true,
    ["test of faith"] = true, ["gaias revenge"] = true,
    -- Standard spell curve. necrocide's damage line is its own name (negative); void
-   -- sermon's is 'wail', recorded as void sermon (negative) by cdt wail.
+   -- sermon's is 'sermon', recorded as void sermon (negative).
    ["void sermon"] = true, ["necrocide"] = true,
 }
 
@@ -19547,8 +19834,7 @@ local DAMAGE_VERB_TO_SPELL = {
    ["frenzied attack"] = "charge",
    ["hammering blow"] = "hammering blow",
    ["wrath of gaia"] = "gaias revenge",
-   -- void sermon's word is "wail", shared with sonic weapons; cdt wail files it under
-   -- its own name.
+   -- void sermon's word is "sermon", recorded under the spell's own name.
    ["void sermon"] = "void sermon",
    ["necrocide"] = "necrocide",
 }
@@ -21592,56 +21878,120 @@ function CmdGaias(name, line, wildcards)
       table.concat(GAIAS_ELEMENTS, ", ") .. ", or clear.")
 end
 
-WAIL_MODE_TEXT = {
-   weapon = "weapon (all wail is melee, sonic)",
-   sermon = "sermon (all wail is void sermon, negative)",
-}
+-- cdt wail (4.4.6-4.6.0) told your wail lines apart from void sermon. The game now
+-- prints void sermon as 'sermon', so wail is always a sonic weapon. cdt wail relabel
+-- files your own wail from before the change under void sermon, for a player who never
+-- used a sonic weapon (cdt wail weapon, the old default, recorded every cast as wail).
+WAIL_RELABEL_BEFORE = 1794268800   -- 2026-11-10 00:00 UTC: void sermon printed 'wail' before it
+WAIL_RELABEL_CLASS = "Harmer"      -- the subclass that casts void sermon
+WAIL_RELABEL_WHERE = string.format("lower(attack_name) = 'wail' AND class = %s COLLATE NOCASE",
+   fixsql(WAIL_RELABEL_CLASS))
+
+-- Your snapshot baselines hold all-time totals by attack, every subclass together: the
+-- part of a snapshot's wail to move is the harmer wail recorded before both the snapshot
+-- and the change. Worked out before anything moves, header id -> damage.
+local function WailBaselineMoves()
+   local moves = {}
+   if not DbTableExists("main", "snapshot_dmg_baseline") or not DbTableExists("main", "snapshot_headers") then return moves end
+   for _, r in ipairs(db_query("SELECT b.header_id AS id, b.total_damage AS d, h.time AS t FROM snapshot_dmg_baseline b " ..
+         "JOIN snapshot_headers h ON h.id = b.header_id WHERE lower(b.attack_name) = 'wail'")) do
+      local upto = math.min(tonumber(r.t) or 0, WAIL_RELABEL_BEFORE)
+      local old = db_query_one(string.format("SELECT SUM(total_damage) AS d FROM attack_stats WHERE %s AND slice_start < %d",
+         WAIL_RELABEL_WHERE, upto)) or {}
+      local move = math.min(tonumber(r.d) or 0, tonumber(old.d) or 0)
+      if move > 0 then moves[tonumber(r.id) or 0] = move end
+   end
+   return moves
+end
+
+local function RelabelWailBaselines(moves)
+   for id, move in pairs(moves) do
+      do
+         if not db_exec(string.format("INSERT OR IGNORE INTO snapshot_dmg_baseline (header_id, attack_name, damtype, category, total_damage) " ..
+               "VALUES (%d, 'void sermon', 'negative', 'spell', 0)", id))
+            or not db_exec(string.format("UPDATE snapshot_dmg_baseline SET total_damage = total_damage + %d " ..
+               "WHERE header_id = %d AND attack_name = 'void sermon'", move, id))
+            or not db_exec(string.format("UPDATE snapshot_dmg_baseline SET total_damage = total_damage - %d " ..
+               "WHERE header_id = %d AND lower(attack_name) = 'wail'", move, id))
+            or not db_exec(string.format("DELETE FROM snapshot_dmg_baseline WHERE header_id = %d " ..
+               "AND lower(attack_name) = 'wail' AND total_damage <= 0", id)) then
+            return false
+         end
+      end
+   end
+   return true
+end
+
+local function WailCutoffText()
+   return ShowDate("%m/%d/%Y %H:%M", WAIL_RELABEL_BEFORE) .. " " .. TZDate("%Z", WAIL_RELABEL_BEFORE)
+end
+
+local function WailRelabel(confirm)
+   if not db or not DbTableExists("main", "attack_stats") then
+      ColourNote("yellow", "", "[CDT] No damage database to relabel.")
+      return
+   end
+   local old = db_query_one(string.format("SELECT COUNT(*) AS n, SUM(total_damage) AS d, MIN(slice_start) AS a, " ..
+      "MAX(slice_start) AS b FROM attack_stats WHERE %s AND slice_start < %d", WAIL_RELABEL_WHERE, WAIL_RELABEL_BEFORE)) or {}
+   local rows, dmg = tonumber(old.n) or 0, tonumber(old.d) or 0
+   if rows == 0 then
+      ColourNote("cyan", "", "[CDT] Nothing to relabel: none of your damage as a harmer before " ..
+         WailCutoffText() .. " is recorded as wail.")
+      return
+   end
+   local all = db_query_one("SELECT SUM(total_damage) AS d FROM attack_stats WHERE lower(attack_name) = 'wail'") or {}
+   local left = (tonumber(all.d) or 0) - dmg
+   if not confirm then
+      ColourNote("orange", "", string.rep("-", 80))
+      ColourNote("gold", "", " Relabel your old wail as void sermon")
+      ColourNote("orange", "", string.rep("-", 80))
+      ColourNote("silver", "", string.format(" %-22s", "Your wail to move"), "lime", "", comma_value(dmg) ..
+         string.format(" damage, %s row%s", comma_value(rows), rows == 1 and "" or "s"))
+      ColourNote("silver", "", string.format(" %-22s", "Recorded"), "white", "",
+         ShowDate("%Y-%m-%d", tonumber(old.a) or 0) .. " to " .. ShowDate("%Y-%m-%d", tonumber(old.b) or 0))
+      ColourNote("silver", "", string.format(" %-22s", "Game change"), "white", "", WailCutoffText())
+      ColourNote("silver", "", string.format(" %-22s", "Left as wail"), "white", "", comma_value(left) ..
+         " damage (since then, or not as a harmer)")
+      ColourNote("orange", "", string.rep("-", 80))
+      ColourNote("silver", "", " Before the game renamed it, void sermon printed 'wail', and cdt wail weapon")
+      ColourNote("silver", "", " (the default) recorded it as a sonic weapon. If you never used a weapon with")
+      ColourNote("silver", "", " wail as a harmer, this files your harmer wail from then under void sermon:")
+      ColourNote("silver", "", " negative spell damage, in your damage tables, damage types, mastery and")
+      ColourNote("silver", "", " snapshots. Wail as another subclass, groupmates' wail and wail that hit you")
+      ColourNote("silver", "", " stay as they are.")
+      ColourNote("yellow", "", " A backup is made first. cdt wail relabel confirm to do it.")
+      return
+   end
+   pcall(function() db:exec("PRAGMA wal_checkpoint(TRUNCATE);") end)
+   local dst = string.format("%s.pre-wail-relabel-%s.bak", db_path, os.date("%Y%m%d-%H%M%S"))
+   local ok, err = DbFileCopy(db_path, dst)
+   if not ok then
+      ColourNote("red", "", "[CDT] Backup failed, nothing changed: " .. tostring(err))
+      return
+   end
+   FlushCombatBuffer()
+   local baseline_moves = WailBaselineMoves()
+   local moved = FoldRenamedAttack("wail", "void sermon", "negative", "spell", {
+      tables = {attack_stats = true}, before = WAIL_RELABEL_BEFORE, class = WAIL_RELABEL_CLASS, force = true,
+      extra = function() return RelabelWailBaselines(baseline_moves) end})
+   if not moved then
+      ColourNote("red", "", "[CDT] Relabel failed and was rolled back; nothing changed.")
+      return
+   end
+   ColourNote("cyan", "", string.format("[CDT] %s damage (%s row%s) of your harmer wail is now void sermon. Backup: %s",
+      comma_value(dmg), comma_value(moved), moved == 1 and "" or "s", dst:match("[^\\/]+$") or dst))
+end
 
 function CmdWail(name, line, wildcards)
-   local raw = ((wildcards and wildcards[1]) or ""):match("^%s*(.-)%s*$"):lower()
-   local cost = WailSermonCost()
-   local race = state.current.race or ""
-   if raw == "" or raw == "help" then
-      local mode = WailMode()
-      ColourNote("orange", "", string.rep("-", 64))
-      ColourNote("gold", "", " Wail Tracking (your own damage lines)")
-      ColourNote("orange", "", string.rep("-", 64))
-      ColourNote("silver", "", "  Current: ", "cyan", "", WAIL_MODE_TEXT[mode] or
-         string.format("both (by your mana: a cast costs %d)", cost))
-      ColourNote("silver", "", "  Race:    ", "cyan", "", race:lower() == "eldar" and
-         string.format("Eldar (void sermon costs %d mana)", cost) or
-         string.format("%s (void sermon costs %d mana; Eldar %d)", race ~= "" and race or "?", cost,
-            WAIL_SERMON_COST * 0.75))
-      ColourNote("orange", "", string.rep("-", 64))
-      ColourNote("cyan", "", "   cdt wail sermon   ", "dimgray", "", ": ", "silver", "", "all wail is void sermon (spell, negative)")
-      ColourNote("cyan", "", "   cdt wail weapon   ", "dimgray", "", ": ", "silver", "", "all wail is a melee weapon hit (sonic)")
-      ColourNote("cyan", "", "   cdt wail both     ", "dimgray", "", ": ", "silver", "", "told apart by your mana (see the warning)")
-      ColourNote("orange", "", string.rep("-", 64))
-      ColourNote("dimgray", "", " 'wail' is the damage word of both void sermon and sonic weapons.")
-      ColourNote("dimgray", "", " Groupmates' wail is always counted as a sonic weapon.")
-      ColourNote("dimgray", "", " Damage already recorded keeps the name and type it was given.")
+   local args = ((wildcards and wildcards[1]) or ""):lower()
+   local sub, rest = args:match("^%s*(%S*)%s*(.-)%s*$")
+   if sub == "relabel" then
+      WailRelabel(rest == "confirm")
       return
    end
-   if not WAIL_MODES[raw] then
-      ColourNote("yellow", "", "[CDT] Usage: cdt wail [sermon|weapon|both]")
-      return
-   end
-   if raw ~= "both" and #wail_pending > 0 then ResolveWailPending("mode") end
-   config.wail_mode = raw
-   state_save()
-   if raw == "sermon" then
-      ColourNote("cyan", "", "[CDT] Wail tracking: sermon. Your wail is recorded as void sermon (negative).")
-   elseif raw == "weapon" then
-      ColourNote("cyan", "", "[CDT] Wail tracking: weapon. Your wail is recorded as a sonic weapon hit.")
-   else
-      ColourNote("cyan", "", "[CDT] Wail tracking: both. A wail line counts as void sermon when your mana")
-      ColourNote("cyan", "", string.format("      drops by at least %d (the cost of a cast) by the next mana update, and as", cost))
-      ColourNote("cyan", "", "      a weapon hit when it doesn't.")
-      ColourNote("yellow", "", "[CDT] Warning: this only works if nothing else gives you mana while you fight.")
-      ColourNote("yellow", "", "      Don't use consume (corpses for mana) or other mana regen in combat, or")
-      ColourNote("yellow", "", "      casts will be counted as weapon hits. Another spell cast at the same")
-      ColourNote("yellow", "", "      moment can make a weapon hit count as void sermon.")
-   end
+   ColourNote("cyan", "", "[CDT] cdt wail is no longer needed: void sermon's damage line is now 'sermon',")
+   ColourNote("cyan", "", "      which CDT records as void sermon. Your wail is always a sonic weapon.")
+   ColourNote("cyan", "", "      cdt wail relabel files your harmer wail from before the change under void sermon.")
 end
 
 -- Called once the login snapshot chain finishes.
@@ -23059,14 +23409,26 @@ end
 function ScopeDoubleSecs(sc)
    local now, from = os.time(), sc.start or 0
    local to = sc.stop or now
-   local total = 0
+   local spans = {}
    for _, r in ipairs(db_query(string.format(
          "SELECT start_time, end_time FROM double_xp_log WHERE end_time = 0 OR end_time > %d", from))) do
       local st, en = tonumber(r.start_time) or 0, tonumber(r.end_time) or 0
       if en == 0 then en = state.current.double_active and now or st end
       st, en = math.max(st, from), math.min(en, to)
-      if en > st then total = total + (en - st) end
+      if en > st then spans[#spans + 1] = {st, en} end
    end
+   -- Doubles that overlap (older rows left open) count once: merge, then add up.
+   table.sort(spans, function(a, b) return a[1] < b[1] end)
+   local total, cs, ce = 0, nil, nil
+   for _, sp in ipairs(spans) do
+      if cs and sp[1] <= ce then
+         if sp[2] > ce then ce = sp[2] end
+      else
+         if cs then total = total + (ce - cs) end
+         cs, ce = sp[1], sp[2]
+      end
+   end
+   if cs then total = total + (ce - cs) end
    return total
 end
 
@@ -23207,6 +23569,15 @@ function ScopeTotals(sc, want)
             " GROUP BY area ORDER BY n DESC LIMIT 5")) do
          b.areas[#b.areas + 1] = {area = (r.area and r.area ~= "") and r.area or "unknown", n = tonumber(r.n) or 0}
       end
+      local sk = {tiers = {}, total = 0}
+      if DbTableExists("main", "skin_bloot_log") then
+         for _, r in ipairs(db_query("SELECT tier, COUNT(*) AS n FROM skin_bloot_log WHERE " .. W("time") .. " GROUP BY tier")) do
+            local cnt = tonumber(r.n) or 0
+            sk.tiers[r.tier] = cnt
+            sk.total = sk.total + cnt
+         end
+      end
+      b.skin = sk
       t.bloot = b
       if not t.xp then
          t.kills = one("SELECT COUNT(*) AS n FROM kills WHERE " .. W("time")).n
@@ -23709,7 +24080,8 @@ PERIOD_TABLES = {
       {"Other", 7, function(t) return t.other.trains end},
       {"Tr/hr", 7, function(t, a) return PerHourCell(t.trains, a, 1) end}}},
    bloot = {want = {bloot = true}, cols = {
-      {"Bloot", 7, function(t) return t.bloot.total end}, {"Kills", 9, function(t) return t.kills or 0 end},
+      {"Regular", 8, function(t) return t.bloot.total end}, {"Skinned", 8, function(t) return t.bloot.skin.total end},
+      {"Kills", 9, function(t) return t.kills or 0 end},
       {"1 per", 8, function(t) return t.bloot.total > 0 and math.floor((t.kills or 0) / t.bloot.total) or "-" end},
       {"Best tier", 14, function(t) return TopBlootTier(t.bloot) end}}},
 }
@@ -24051,7 +24423,7 @@ function ReportBloot(sc, t, active, approx)
    local b = t.bloot
    if sc.key ~= "all" then
       local kills = t.kills or 0
-      ReportRow("Total", comma_value(b.total), "white", 0,
+      ReportRow("Regular bloot", comma_value(b.total), "white", 0,
          (b.total > 0 and kills > 0) and ("1 per " .. comma_value(math.floor(kills / b.total)) .. " kills") or nil)
       for i = #BLOOT_TIERS, 1, -1 do
          local n = b.tiers[BLOOT_TIERS[i]]
@@ -24061,6 +24433,13 @@ function ReportBloot(sc, t, active, approx)
          ReportRow("By area", "", "white")
          for _, a in ipairs(b.areas) do ReportRow(a.area, comma_value(a.n), "white", 1) end
       end
+      if b.skin.total > 0 then
+         ReportRow("Skinned bloot", comma_value(b.skin.total), "white")
+         for i = #BLOOT_TIERS, 1, -1 do
+            local n = b.skin.tiers[BLOOT_TIERS[i]]
+            if n and n > 0 then ReportRow(BlootCode(BLOOT_TIERS[i], true), comma_value(n), "white", 1) end
+         end
+      end
       return
    end
    local periods = {}
@@ -24068,32 +24447,51 @@ function ReportBloot(sc, t, active, approx)
       periods[#periods + 1] = {ScopeTotals(ReportScope(row[1]), {bloot = true}).bloot,
          ScopeTotals(ReportScope(row[2]), {bloot = true}).bloot}
    end
+   ColourNote("gold", "", " Regular bloot")
    ColourNote("gray", "", string.format(" %-12s %6s", "", ""),
       "white", "", string.format("%14s%14s%14s%14s", "Today", "This week", "This month", "This year"))
    local sub = {}
    for _ = 1, 4 do sub[#sub + 1] = string.format("%7s%7s", "yours", "aard") end
    ColourNote("gray", "", string.format(" %-12s %6s", "Tier", "All"), "gray", "", table.concat(sub))
-   local shown = 0
-   for i = #BLOOT_TIERS, 1, -1 do
-      local tier = BLOOT_TIERS[i]
-      if (b.tiers[tier] or 0) > 0 then
-         local cells = {}
-         for _, per in ipairs(periods) do
-            cells[#cells + 1] = string.format("%7s%7s", comma_value(per[1].tiers[tier] or 0), comma_value(per[2].tiers[tier] or 0))
+   -- pick: the drops (b) or the skins (b.skin) of one period's bloot.
+   local function tier_rows(all_b, pick)
+      local shown = 0
+      for i = #BLOOT_TIERS, 1, -1 do
+         local tier = BLOOT_TIERS[i]
+         if (all_b.tiers[tier] or 0) > 0 then
+            local cells = {}
+            for _, per in ipairs(periods) do
+               cells[#cells + 1] = string.format("%7s%7s", comma_value(pick(per[1]).tiers[tier] or 0),
+                  comma_value(pick(per[2]).tiers[tier] or 0))
+            end
+            local args = CodedArgs(" " .. CodedPad(BlootCode(tier, true), 12) .. " ", "white")
+            args[#args + 1] = "white"; args[#args + 1] = ""; args[#args + 1] = string.format("%6s", comma_value(all_b.tiers[tier]))
+            args[#args + 1] = "silver"; args[#args + 1] = ""; args[#args + 1] = table.concat(cells)
+            ColourNote(unpack(args))
+            shown = shown + 1
          end
-         local args = CodedArgs(" " .. CodedPad(BlootCode(tier, true), 12) .. " ", "white")
-         args[#args + 1] = "white"; args[#args + 1] = ""; args[#args + 1] = string.format("%6s", comma_value(b.tiers[tier]))
-         args[#args + 1] = "silver"; args[#args + 1] = ""; args[#args + 1] = table.concat(cells)
-         ColourNote(unpack(args))
-         shown = shown + 1
       end
+      return shown
    end
-   if shown == 0 then ColourNote("silver", "", " No bloot recorded yet.") end
-   local cells = {}
-   for _, per in ipairs(periods) do cells[#cells + 1] = string.format("%7s%7s", comma_value(per[1].total), comma_value(per[2].total)) end
-   ColourNote("orange", "", string.rep("-", REPORT_W))
-   ColourNote("white", "", string.format(" %-12s ", "Total"), "white", "", string.format("%6s", comma_value(b.total)),
-      "yellow", "", table.concat(cells))
+   local function total_row(label, all_b, pick)
+      local cells = {}
+      for _, per in ipairs(periods) do
+         cells[#cells + 1] = string.format("%7s%7s", comma_value(pick(per[1]).total), comma_value(pick(per[2]).total))
+      end
+      ColourNote("orange", "", string.rep("-", REPORT_W))
+      ColourNote("white", "", string.format(" %-12s ", label), "white", "", string.format("%6s", comma_value(all_b.total)),
+         "yellow", "", table.concat(cells))
+   end
+   local drops = function(x) return x end
+   if tier_rows(b, drops) == 0 then ColourNote("silver", "", " No bloot recorded yet.") end
+   total_row("Total", b, drops)
+   if b.skin.total > 0 then
+      local skins = function(x) return x.skin end
+      ColourNote("white", "", "")
+      ColourNote("gold", "", " Skinned bloot")
+      tier_rows(b.skin, skins)
+      total_row("Total", b.skin, skins)
+   end
    local ws = WeekStartName()
    ColourNote("dimgray", "", string.format(" yours: %s, weeks from %s.", TZLabel() or "this computer's timezone",
       ws:sub(1, 1):upper() .. ws:sub(2)))
@@ -24223,7 +24621,10 @@ function ReportOverview(sc, t, active, approx)
    OverviewRow("Quests", comma_value(q.done), q.failed > 0 and (comma_value(q.failed) .. " failed") or "")
    OverviewRow("Campaigns", comma_value(c.done), c.failed > 0 and (comma_value(c.failed) .. " failed") or "")
    OverviewRow("GQs", comma_value(gq.finished), comma_value(gq.won) .. " won")
-   OverviewRow("Bloot", comma_value(t.bloot.total), TopTiersText(t.bloot, all and 2 or 3))
+   OverviewRow("Regular bloot", comma_value(t.bloot.total), TopTiersText(t.bloot, all and 2 or 3))
+   if t.bloot.skin.total > 0 then
+      OverviewRow("Skinned bloot", comma_value(t.bloot.skin.total), TopTiersText(t.bloot.skin, all and 2 or 3))
+   end
    if not all then return end
 
    for side = 1, 2 do
@@ -24273,7 +24674,8 @@ function BuildGainsReportLine(kind, sc, t, active)
       if t.pup.n > 0 then add("@W" .. short_value(t.pup.n) .. " @wpup") end
       add("@W" .. short_value(x.kills) .. " @wkills")
       add(string.format("@W%s@wq @W%s@wcp @W%s@wgq", comma_value(t.quests.done), comma_value(t.cps.done), comma_value(t.gqs.finished)))
-      if t.bloot.total > 0 then add("@M" .. comma_value(t.bloot.total) .. " @wbloot") end
+      if t.bloot.total > 0 then add("@M" .. comma_value(t.bloot.total) .. " @wregular bloot") end
+      if t.bloot.skin.total > 0 then add("@M" .. comma_value(t.bloot.skin.total) .. " @wskinned bloot") end
 
    elseif kind == "xp" then
       local x = t.xp
@@ -24382,7 +24784,7 @@ function BuildGainsReportLine(kind, sc, t, active)
 
    elseif kind == "bloot" then
       local b = t.bloot
-      add("@W" .. comma_value(b.total))
+      add("@wregular @W" .. comma_value(b.total))
       local tiers = {}
       for i = #BLOOT_TIERS, 1, -1 do
          local n = b.tiers[BLOOT_TIERS[i]]
@@ -24395,6 +24797,14 @@ function BuildGainsReportLine(kind, sc, t, active)
          local areas = {}
          for i = 1, math.min(3, #b.areas) do areas[#areas + 1] = "@w" .. b.areas[i].area .. " @W" .. b.areas[i].n end
          add(table.concat(areas, "@D, "))
+      end
+      if b.skin.total > 0 then
+         local skins = {}
+         for i = #BLOOT_TIERS, 1, -1 do
+            local n = b.skin.tiers[BLOOT_TIERS[i]]
+            if n and n > 0 then skins[#skins + 1] = BlootCode(BLOOT_TIERS[i]) .. " @W" .. comma_value(n) end
+         end
+         add("@wskinned @W" .. comma_value(b.skin.total) .. " " .. table.concat(skins, "@D, "))
       end
    end
    return title .. " " .. table.concat(parts, " ") .. "@D]"
@@ -25352,7 +25762,7 @@ function CmdReset(name, line, wildcards)
       ColourNote("red", "", "   - All quests, campaigns, global quests")
       ColourNote("red", "", "   - All milestones, subclass/race/combo stats")
       ColourNote("red", "", "   - All lifetime totals (QP earned, pups, mobs)")
-      ColourNote("red", "", "   - All earnings, gold log, daily totals, bloot log")
+      ColourNote("red", "", "   - All earnings, gold log, daily totals, bloot logs")
       ColourNote("red", "", "   - All damage stats, player profiles, deaths, fight logs")
       ColourNote("red", "", "   - All heals (on you, by you, by groupmates) and damage taken")
       ColourNote("red", "", "   - Double XP log, GQ joins, pre-v3.9 damage estimates")
@@ -25365,7 +25775,7 @@ function CmdReset(name, line, wildcards)
             "sessions", "levels", "kills", "quests", "campaigns",
             "gquests", "earnings", "gold_log", "daily_totals",
             "milestones", "class_stats", "race_stats", "combo_stats",
-            "bloot_log", "player_totals", "tracked_sessions",
+            "bloot_log", "skin_bloot_log", "player_totals", "tracked_sessions",
             "attack_stats", "damtype_stats", "area_combat_stats",
             "player_profiles", "player_attack_stats", "heal_log", "heal_given", "group_heals", "damage_taken",
             "deaths", "unfinished_fights", "double_xp_log", "gq_joins", "legacy_damage", "worth_trace",
@@ -27526,6 +27936,49 @@ end
 
 -- The change history, newest first: {version, db, title, {{heading, {bullets}}, ...}}.
 CHANGELOG = {
+   {version = "4.7.0", db = 43, title = "Bloot from skinning", sections = {
+      {"Upgrading", {
+         "Database version 42 to 43: a new log for bloot from skinning. A backup is made first, as with every upgrade. Nothing already recorded changes.",
+      }},
+      {"New", {
+         "Skinned bloot is tracked: when a skin is crafted into bloot (You craft the cloak further into: (Polished) ...), CDT records its tier, the item, the mob it was skinned from and the area.",
+         "cdt gains report shows it on its own Skinned bloot row, with its best tiers, under the Bloot row, which is now Regular bloot. cdt gains report bloot lists it by tier under Regular bloot, for every period; its tables over time (cdt gains report bloot 7day) have Regular and Skinned columns; and both go in the channel line.",
+         "Skinned bloot is kept apart from regular bloot: it isn't in Regular bloot, the 1 per how many kills rate, bloot by area or the bloot column of cdt gains compare.",
+      }},
+   }},
+   {version = "4.6.1", db = 42, title = "void sermon's new damage line", sections = {
+      {"Upgrading", {
+         "Database version 41 to 42. A backup is made first, as with every upgrade. Damage recorded under 'sermon' since the game changed the line is filed under void sermon, with its damage type (negative, spell), and CDT says how many rows it moved.",
+      }},
+      {"Fixes", {
+         "void sermon's damage line changed from 'wail' to 'sermon' in the game. CDT now records a sermon line as void sermon, negative spell damage, for you, your groupmates and anyone who hits you; it was recorded as 'sermon' with an unknown damage type.",
+         "cdt wail is retired. It told your wail lines apart from void sermon when both printed 'wail'; wail is now always a sonic weapon, whatever cdt wail was set to. Damage already recorded keeps the name it was given.",
+      }},
+      {"New", {
+         "cdt wail relabel: if you never used a sonic weapon as a harmer, your wail as a harmer from before the change (2026-11-10) was void sermon, recorded as a weapon by the old default. cdt wail relabel shows how much would move, and cdt wail relabel confirm makes a backup and files it under void sermon, negative spell damage: your damage tables, damage types, mastery and snapshots. Wail recorded as another subclass, groupmates' wail and wail that hit you are left alone.",
+      }},
+   }},
+   {version = "4.6.0", db = 41, title = "A player's damage to you", sections = {
+      {"Upgrading", {
+         "Database version 40 to 41: damage taken gets two columns for timing. A backup is made first, as with every upgrade. Damage already recorded is kept, but it never had any timing, so it can't count toward the new DPS figure.",
+      }},
+      {"New", {
+         "cdt dmg player <name> has a new section, <name>'s Damage To You: their total damage on you, hits, average and biggest hit, the 30-minute window of their last hit, and each attack with its damage type. It covers all your history.",
+         "A second new section, DPS While Attacking You, shows their DPS on you, the time they spent attacking you and the damage done in that time. It counts from this version on. Time runs from their first round to their last, a gap of over 10 seconds starts a new run, and the first round's damage is left out because it has no time of its own. It shows -- until there is timed damage.",
+         "Players who were never in your group now get a report too, as long as they have hit you or healed you, instead of No data.",
+      }},
+   }},
+   {version = "4.5.2", db = 40, title = "Double XP time counted once, failed writes shown", sections = {
+      {"Upgrading", {
+         "Database version 39 to 40: the double XP log is repaired. A backup is made first, as with every upgrade, and CDT says how many periods it repaired.",
+      }},
+      {"Fixes", {
+         "Before 4.3.1 the end of a double was often not saved, so some rows in the double XP log stayed open and a later end closed several at once. Those periods overlapped, and the reports added them up, so double time could come out many times too long (some players saw thousands of hours over a few weeks). The upgrade ends each such period at its last double XP kill, or gives it no length if it had none. Periods that were saved correctly, and a double running right now, are not touched. Reports for older dates will show much less double time than before, and much closer to what it was: a repaired period ends at its last double XP kill, so idle minutes at its end are not counted.",
+         "Double time that overlaps is now counted once in every report, so a period like that can no longer be added twice.",
+         "A database write that failed was reported as saved, so nothing showed when a write was refused. CDT now checks the result: a failed write prints the SQLite error and the statement in red, and the plugin carries on.",
+         "CDT now waits up to 3 seconds when the database is locked for a moment, for example while a backup or another program has it open, instead of failing the write.",
+      }},
+   }},
    {version = "4.5.1", db = 39, title = "cdt potential", sections = {
       {"Upgrading", {
          "No database change from 4.5.0.",

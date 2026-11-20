@@ -2,6 +2,66 @@
 
 Newest first. The database version is shown for each release; an upgrade backs the database up first.
 
+## 4.7.0 - Bloot from skinning
+
+Database version: 43
+
+### Upgrading
+
+- Database version 42 to 43: a new log for bloot from skinning. A backup is made first, as with every upgrade. Nothing already recorded changes.
+
+### New
+
+- Skinned bloot is tracked: when a skin is crafted into bloot (You craft the cloak further into: (Polished) ...), CDT records its tier, the item, the mob it was skinned from and the area.
+- cdt gains report shows it on its own Skinned bloot row, with its best tiers, under the Bloot row, which is now Regular bloot. cdt gains report bloot lists it by tier under Regular bloot, for every period; its tables over time (cdt gains report bloot 7day) have Regular and Skinned columns; and both go in the channel line.
+- Skinned bloot is kept apart from regular bloot: it isn't in Regular bloot, the 1 per how many kills rate, bloot by area or the bloot column of cdt gains compare.
+
+## 4.6.1 - void sermon's new damage line
+
+Database version: 42
+
+### Upgrading
+
+- Database version 41 to 42. A backup is made first, as with every upgrade. Damage recorded under 'sermon' since the game changed the line is filed under void sermon, with its damage type (negative, spell), and CDT says how many rows it moved.
+
+### Fixes
+
+- void sermon's damage line changed from 'wail' to 'sermon' in the game. CDT now records a sermon line as void sermon, negative spell damage, for you, your groupmates and anyone who hits you; it was recorded as 'sermon' with an unknown damage type.
+- cdt wail is retired. It told your wail lines apart from void sermon when both printed 'wail'; wail is now always a sonic weapon, whatever cdt wail was set to. Damage already recorded keeps the name it was given.
+
+### New
+
+- cdt wail relabel: if you never used a sonic weapon as a harmer, your wail as a harmer from before the change (2026-11-10) was void sermon, recorded as a weapon by the old default. cdt wail relabel shows how much would move, and cdt wail relabel confirm makes a backup and files it under void sermon, negative spell damage: your damage tables, damage types, mastery and snapshots. Wail recorded as another subclass, groupmates' wail and wail that hit you are left alone.
+
+## 4.6.0 - A player's damage to you
+
+Database version: 41
+
+### Upgrading
+
+- Database version 40 to 41: damage taken gets two columns for timing. A backup is made first, as with every upgrade. Damage already recorded is kept, but it never had any timing, so it can't count toward the new DPS figure.
+
+### New
+
+- cdt dmg player <name> has a new section, <name>'s Damage To You: their total damage on you, hits, average and biggest hit, the 30-minute window of their last hit, and each attack with its damage type. It covers all your history.
+- A second new section, DPS While Attacking You, shows their DPS on you, the time they spent attacking you and the damage done in that time. It counts from this version on. Time runs from their first round to their last, a gap of over 10 seconds starts a new run, and the first round's damage is left out because it has no time of its own. It shows -- until there is timed damage.
+- Players who were never in your group now get a report too, as long as they have hit you or healed you, instead of No data.
+
+## 4.5.2 - Double XP time counted once, failed writes shown
+
+Database version: 40
+
+### Upgrading
+
+- Database version 39 to 40: the double XP log is repaired. A backup is made first, as with every upgrade, and CDT says how many periods it repaired.
+
+### Fixes
+
+- Before 4.3.1 the end of a double was often not saved, so some rows in the double XP log stayed open and a later end closed several at once. Those periods overlapped, and the reports added them up, so double time could come out many times too long (some players saw thousands of hours over a few weeks). The upgrade ends each such period at its last double XP kill, or gives it no length if it had none. Periods that were saved correctly, and a double running right now, are not touched. Reports for older dates will show much less double time than before, and much closer to what it was: a repaired period ends at its last double XP kill, so idle minutes at its end are not counted.
+- Double time that overlaps is now counted once in every report, so a period like that can no longer be added twice.
+- A database write that failed was reported as saved, so nothing showed when a write was refused. CDT now checks the result: a failed write prints the SQLite error and the statement in red, and the plugin carries on.
+- CDT now waits up to 3 seconds when the database is locked for a moment, for example while a backup or another program has it open, instead of failing the write.
+
 ## 4.5.1 - cdt potential
 
 Database version: 39

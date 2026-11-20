@@ -5,7 +5,7 @@ the only data tracking aardwolf plugin you need
 what you earn, deal, take and heal, as it happens, into a local SQLite database,
 and turns it into reports, rates, projections and live meter windows.
 
-Current version: **4.5.0** (database v39). Type `cdt help` in game for the command
+Current version: **4.7.0** (database v43). Type `cdt help` in game for the command
 list, and `cdt help <topic>` for any topic below.
 
 ---
@@ -137,7 +137,7 @@ A type without a scope shows all time; the overview always needs a scope
 | `gq` | joined, finished, won, QP (mob kills + winning), gold, TP, trains, pracs |
 | `level` | solo/grouped, average and fastest time, trains and bonus trains, HP/MP/MV, per hour; total levels |
 | `powerup` (`pup`) | the same for powerups, with lifetime powerups |
-| `bloot` | bonus loot by tier (best first), 1 per how many kills, by area |
+| `bloot` | regular bonus loot by tier (best first), 1 per how many kills, by area; then skinned bloot by tier, counted on its own |
 | `tp` | trivia points from quests, campaigns, GQs, trivia mobs and anything else; TP/hr |
 | `trains` | trains from level-ups and powerups (base, lucky, blessing, instinct), quests, campaigns, GQs and other; trains/hr |
 
@@ -318,7 +318,7 @@ take, and each groupmate's damage. Type `cdt dmg` for the list.
 | `cdt dmg area [N]` | combat efficiency per area (top 20 by default) |
 | `cdt dmg attacks [N]` | each attack by DPS (top 25 by default) |
 | `cdt dmg types` | each damage type (fire, slash, ...) |
-| `cdt dmg player <name>` | a scouting report for one groupmate, with their heals on you |
+| `cdt dmg player <name>` | a report on one player: their damage as a groupmate, their heals on you, their damage to you, and their DPS while attacking you (timed from 4.6.0 on). Works for any player who has hit you, grouped or not |
 | `cdt dmg players` | every player seen, summarised |
 | `cdt dmg taken` | damage you took, by mob, attack, damage type, race and subclass |
 | `cdt dmg taken player <name>` / `taken players` | a groupmate's damage taken / everyone ranked by it |
@@ -639,22 +639,24 @@ capture and hiding trigger off.
 don't say their element, so tell the plugin your focus. Unfocused, crafter and
 hunter gaias revenge count as an even mix. Recorded damage keeps its tag.
 
-**`cdt wail`** (4.4.6): the harmer spell **void sermon** shows its damage as
-`Your wail ...`, the same word a sonic weapon uses, so tell the plugin which
-yours is:
+**`cdt wail`** (retired in 4.6.1): void sermon's damage line used to be `Your
+wail ...`, the same word a sonic weapon uses, and `cdt wail` told the two apart.
+The game now prints it as `Your sermon ...`, which CDT records as void sermon
+(negative spell damage) for you, groupmates and anyone hitting you, so wail is
+always a sonic weapon and `cdt wail` only says so. Damage recorded under
+`sermon` before 4.6.1 is filed under void sermon on upgrade.
+
+If you never used a sonic weapon as a harmer, your `wail` as a harmer from
+before the change (2026-11-10) was void sermon, recorded as a weapon by the old
+default:
 
 | Command | What it does |
 |---|---|
-| `cdt wail` | the current setting |
-| `cdt wail weapon` | all your wail is a sonic melee weapon hit (the default) |
-| `cdt wail sermon` | all your wail is void sermon: negative spell damage, under its own name in every damage table, the meter and mastery |
-| `cdt wail both` | each wail line is void sermon if your mana drops by a cast's cost (80, Eldar 60) by the next mana update, else a weapon hit |
+| `cdt wail relabel` | how much of your wail would move, and its dates |
+| `cdt wail relabel confirm` | makes a backup, then files it under void sermon in your damage tables, damage types, mastery and snapshots |
 
-- **`both` needs** nothing else giving you mana while you fight: consume
-  (corpses for mana) or regen hides a cast, and another spell cast at the same
-  moment can make a weapon hit count as void sermon.
-- **Groupmates' wail**, and a mob's wail on you, are always a sonic weapon.
-- **Recorded damage** keeps the name and type it was given.
+Wail recorded as another subclass, groupmates' wail and wail that hit you
+stay as they are.
 
 ---
 
