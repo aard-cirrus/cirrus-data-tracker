@@ -10,11 +10,11 @@
    save_state="y"
    date_written="2026-08-26 00:00:00"
    requires="4.73"
-   version="4.70"
+   version="4.71"
 >
 <description trim="y">
 <![CDATA[
-Cirrus Data Tracker v4.7.0
+Cirrus Data Tracker v4.7.1
 (patch releases put their third number into the plugin `version` attribute as
 a decimal digit -- 3.8.1 was 3.81 -- because MushClient parses it as a number.)
 
@@ -591,7 +591,7 @@ local sqlite3 = require("sqlite3")
 -- =============================================================================
 -- CONSTANTS
 -- =============================================================================
-local PLUGIN_VERSION = "4.7.0"
+local PLUGIN_VERSION = "4.7.1"
 local GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"
 local DB_VERSION = 43
 
@@ -27936,6 +27936,12 @@ end
 
 -- The change history, newest first: {version, db, title, {{heading, {bullets}}, ...}}.
 CHANGELOG = {
+   {version = "4.7.1", db = 43, title = "cdt update install works", sections = {
+      {"Fixes", {
+         "If cdt update install says 'the download does not match its checksum', update by hand once: download cirrus_data_tracker.xml from github.com/aard-cirrus/cirrus-data-tracker, put it over your copy, type cdt reload. 4.5.0 to 4.7.0 all fail this way; from 4.7.1 on it works.",
+         "Why: cdt update install always failed its checksum check, though the download was fine. CDT compared the client's checksum, which comes as raw bytes, with the hex one in version.json. It now converts it to hex first, and a client that gives hex already works too.",
+      }},
+   }},
    {version = "4.7.0", db = 43, title = "Bloot from skinning", sections = {
       {"Upgrading", {
          "Database version 42 to 43: a new log for bloot from skinning. A backup is made first, as with every upgrade. Nothing already recorded changes.",
@@ -28779,15 +28785,26 @@ function UpdateReport(info, cmp)
    end
 end
 
+-- The sha256 of s as 64 lowercase hex digits, or nil. MUSHclient's utils.sha256 returns the raw
+-- 32-byte hash, which utils.tohex turns into hex; a client that returns hex already is taken as is.
+function Sha256Hex(s)
+   local raw = utils and utils.sha256 and utils.sha256(s)
+   if type(raw) ~= "string" then return nil end
+   if #raw == 64 and not raw:find("%X") then return raw:lower() end
+   if #raw ~= 32 then return nil end
+   if utils.tohex then return tostring(utils.tohex(raw)):lower() end
+   return (raw:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
 -- Check, write, swap, verify. Returns true and the backup's file name, or false and why. A failure
 -- leaves the plugin file as it was (or puts the old one back).
 function UpdateInstall(info, page)
-   local hasher = utils and utils.sha256
+   local hasher = utils and utils.sha256 and Sha256Hex
    if type(page) ~= "string" or #page < UPDATE_MIN_BYTES or #page > UPDATE_MAX_BYTES then
       return false, "the download is the wrong size; nothing was installed."
    end
    if not hasher then return false, "this client can't check a download (no sha256); nothing was installed." end
-   if tostring(hasher(page)):lower() ~= info.sha256 then
+   if hasher(page) ~= info.sha256 then
       return false, "the download does not match its checksum; nothing was installed."
    end
    if not page:find('id="' .. GetPluginID() .. '"', 1, true)
@@ -28806,7 +28823,7 @@ function UpdateInstall(info, page)
    local back = io.open(new_path, "rb")
    local data = back and back:read("*a")
    if back then back:close() end
-   if not wrote or not data or #data ~= #page or tostring(hasher(data)):lower() ~= info.sha256 then
+   if not wrote or not data or #data ~= #page or hasher(data) ~= info.sha256 then
       os.remove(new_path)
       return false, "the new file did not write correctly; nothing was changed."
    end
@@ -28832,7 +28849,7 @@ function UpdateInstall(info, page)
    local check = io.open(path, "rb")
    local landed = check and check:read("*a")
    if check then check:close() end
-   if not landed or tostring(hasher(landed)):lower() ~= info.sha256 then
+   if not landed or hasher(landed) ~= info.sha256 then
       local restored = DbFileCopy(backup, path)
       if restored then os.remove(backup) end
       return false, "the installed file did not verify; "

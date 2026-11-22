@@ -2,6 +2,15 @@
 
 Newest first. The database version is shown for each release; an upgrade backs the database up first.
 
+## 4.7.1 - cdt update install works
+
+Database version: 43
+
+### Fixes
+
+- If cdt update install says 'the download does not match its checksum', update by hand once: download cirrus_data_tracker.xml from github.com/aard-cirrus/cirrus-data-tracker, put it over your copy, type cdt reload. 4.5.0 to 4.7.0 all fail this way; from 4.7.1 on it works.
+- Why: cdt update install always failed its checksum check, though the download was fine. CDT compared the client's checksum, which comes as raw bytes, with the hex one in version.json. It now converts it to hex first, and a client that gives hex already works too.
+
 ## 4.7.0 - Bloot from skinning
 
 Database version: 43

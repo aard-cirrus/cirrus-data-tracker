@@ -5,7 +5,7 @@ the only data tracking aardwolf plugin you need
 what you earn, deal, take and heal, as it happens, into a local SQLite database,
 and turns it into reports, rates, projections and live meter windows.
 
-Current version: **4.7.0** (database v43). Type `cdt help` in game for the command
+Current version: **4.7.1** (database v43). Type `cdt help` in game for the command
 list, and `cdt help <topic>` for any topic below.
 
 ---

@@ -1,9 +1,9 @@
 {
   "name": "Cirrus Data Tracker",
   "plugin_id": "c1770da7a4ac3e5f9b2d8c01",
-  "version": "4.7.0",
+  "version": "4.7.1",
   "db": 43,
-  "sha256": "d56f63e03e4632895ddcebeb159b78a021b9980b4f5193e9ab34ac918c428b2d",
+  "sha256": "f65f03daab6eaf9a5d576a935f5bc76b1e955a6067df0b3660e4b2f8b3abeb0c",
   "file": "cirrus_data_tracker.xml",
-  "published": "2026-11-20T20:40Z"
+  "published": "2026-11-22T19:34Z"
 }
